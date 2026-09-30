@@ -1,0 +1,30 @@
+# 缩量回踩：缩量小幅回调至企稳区（趋势中的低吸点）
+name: shrink_pullback
+display_name: 缩量回踩
+description: 缩量（量比<0.8）小幅回调（-5%~-1%）的活跃股，趋势未破的低吸候选
+version: "1.0"
+style: 低吸
+hard_filters:
+  exclude_st: true
+  amount_min: 100000000
+  change_pct_min: -5.0
+  change_pct_max: -1.0         # 回调而非破位
+  volume_ratio_max: 0.8        # 缩量
+  turnover_min: 1.0            # 但仍需活跃度
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  volume_ratio: 0.40           # 缩得越狠越优先（反向）
+  turnover_rate: 0.25
+  amount: 0.20
+  amplitude: 0.15
+inverted: [volume_ratio]
+# ---- 计算层因子（FACTOR_META 注册表，K线现算） ----
+compute_filters:               # 回调不破趋势：20日仍上行且贴近MA20
+  mom20: {min: 0}              # 20日动量仍为正（趋势未坏）
+  ma20_dev: {min: -5, max: 3}  # 回踩贴近MA20但不深破
+compute_weights:               # 两段分按权重融合（快照段合计1.0）
+  mom20: 0.35
+  ma20_dev: 0.20
+  vol20: 0.15                  # 低波动优先（反向因子）
+  price_pos_60: 0.30           # 处于60日区间中上部

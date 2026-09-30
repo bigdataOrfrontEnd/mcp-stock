@@ -1,0 +1,21 @@
+# 双低：低市盈率 + 低市净率 + 流动性充足（防守型价值）
+name: dual_low
+display_name: 双低价值
+description: PE≤30 且 PB≤3、成交额过亿的流动性价值标的，防守型配置候选
+version: "1.0"
+style: 低吸
+hard_filters:
+  exclude_st: true
+  amount_min: 100000000        # 成交额 ≥ 1亿
+  pe_min: 0
+  pe_max: 30
+  pb_min: 0
+  pb_max: 3.0
+  price_min: 3
+  total_mv_min: 50
+factor_weights:
+  pe: 0.45
+  pb: 0.35
+  turnover_rate: 0.10
+  amount: 0.10
+inverted: [pe, pb]             # 越低得分越高
