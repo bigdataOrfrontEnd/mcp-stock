@@ -19,3 +19,4 @@ factor_weights:
   turnover_rate: 0.10
   amount: 0.10
 inverted: [pe, pb]             # 越低得分越高
+market_regime: [risk_off, range_bound]   # 防守行情专用

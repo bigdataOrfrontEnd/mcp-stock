@@ -12,10 +12,12 @@ build/
 .uv-cache/
 .smoke/
 
-# 本地数据资产（数据库/报告/策略覆盖，均不入库）
-data/
+# 本地数据资产（数据库/报告不入库；策略 YAML 除外——是核心资产）
+data/*
+!data/strategies/
 *.db
 *.sqlite3
+*.zip
 
 # 环境与密钥
 .env

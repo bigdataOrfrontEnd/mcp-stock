@@ -1,0 +1,26 @@
+# 均线多头（InStock keep_increasing 移植）：MA30 持续上行且升幅>20%
+name: steady_ma30
+display_name: 均线多头
+description: MA30 相对30日前上行超20%（对应 InStock 当日MA30/30日前MA30>1.2），稳定上升通道
+version: "1.0"
+style: 趋势
+market_regime: [risk_on, neutral]
+hard_filters:
+  exclude_st: true
+  amount_min: 100000000
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  mom60: 0.35
+  turnover_rate: 0.20
+  amount: 0.15
+soft_scores:
+  change_pct: {full: [0.5, 6.0], hard: [-2.0, 9.0], weight: 0.15}
+  volume_ratio: {full: [0.8, 2.5], hard: [0.3, 6.0], weight: 0.15}
+compute_filters:
+  ma30_slope: {min: 20}          # MA30/30日前MA30 - 1 ≥ 20%（InStock >1.2）
+  recent_crash: {max: 0}
+compute_weights:
+  ma30_slope: 0.40
+  mom60: 0.35
+  vol20: 0.25                    # 低波动加分（反向）

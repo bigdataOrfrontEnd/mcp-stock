@@ -1,21 +1,37 @@
-# 放量突破：当日放量上涨突破（量比+涨幅+换手共振）
+# 放量突破 v2：AlphaSift 式锚点软打分（量比过热惩罚 + 追高惩罚曲线）
 name: volume_breakout
 display_name: 放量突破
-description: 当日量比≥2、涨幅2~7%、换手活跃的中盘股，捕捉资金进场初段
-version: "1.0"
+description: 当日温和放量上涨突破（锚点曲线惩罚过热与追高），捕捉资金进场初段
+version: "2.1"
 style: 打板/趋势
+market_regime: [risk_on, rotation]   # 适用行情（供早盘策略路由参考）
 hard_filters:
   exclude_st: true
-  amount_min: 200000000        # 成交额 ≥ 2亿
-  change_pct_min: 2.0
-  change_pct_max: 7.0          # 避开一字板（买不进）
+  amount_min: 200000000
+  change_pct_min: 1.0                # 软曲线接管上界，硬界只防极端
   price_min: 3
   price_max: 100
-  volume_ratio_min: 2.0
-  turnover_min: 3.0
-  total_mv_min: 30             # 总市值 ≥ 30亿（排除纯壳）
+  volume_ratio_min: 1.5
+  total_mv_min: 30
 factor_weights:
-  volume_ratio: 0.40
-  turnover_rate: 0.25
-  change_pct: 0.20
+  volume_ratio: 0.35
+  turnover_rate: 0.20
   amount: 0.15
+soft_scores:                          # AlphaSift 武器①②：锚点区间连续打分
+  change_pct:                         # 追高惩罚：2~7%满分，9.8%衰减到0
+    full: [2.0, 7.0]
+    hard: [0.5, 9.8]
+    weight: 0.20
+  volume_ratio:                       # 过热惩罚：2~3倍量满分，8倍衰减到0
+    full: [2.0, 3.0]
+    hard: [1.5, 8.0]
+    weight: 0.10
+# L1.5 计算层段：真突破确认 + 灾害排雷（v2.1，借鉴 InStock low_backtrace 风控）
+compute_filters:
+  price_pos_60:
+    min: 75
+  recent_crash:
+    max: 0                       # 近20日无单日≤-7%/两日≤-10%（排除下跌中继反抽）
+compute_weights:
+  mom20: 0.6
+  vol_ratio: 0.4

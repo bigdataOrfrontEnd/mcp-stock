@@ -1,0 +1,27 @@
+# 高而窄的旗形（InStock high_tight_flag 移植，形态近似版）
+# 原版要求龙虎榜有机构（istop），本版暂不含该门槛——用趋势质量过滤替代
+name: high_tight_flag
+display_name: 高紧旗
+description: 收盘较近24~10日最低价翻近一倍(≥1.9x)且期间连续两日涨停级上涨的极端强势票
+version: "1.0"
+style: 打板
+market_regime: [risk_on]
+hard_filters:
+  exclude_st: true
+  amount_min: 300000000
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  volume_ratio: 0.30
+  turnover_rate: 0.25
+  amount: 0.15
+soft_scores:
+  change_pct: {full: [2.0, 9.8], hard: [0.0, 11.0], weight: 0.15}
+  volume_ratio: {full: [1.5, 4.0], hard: [1.0, 10.0], weight: 0.15}
+compute_filters:
+  high_tight_flag: {min: 100}    # 核心：高紧旗形态成立
+  ma30_slope: {min: 0}
+compute_weights:
+  mom20: 0.40
+  ma30_slope: 0.30
+  breakout_recent: 0.30

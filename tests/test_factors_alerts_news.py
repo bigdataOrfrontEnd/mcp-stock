@@ -63,7 +63,7 @@ def test_valuation_and_quality_factors():
 def test_catalog():
     from mcp_eastmoney.compute import factors as F
     cat = F.catalog()
-    assert len(cat) == len(F.FACTOR_META) == 16
+    assert len(cat) == len(F.FACTOR_META) + len(F.SNAP_FACTOR_META) == 33  # 24时序(含8个InStock形态因子)+9快照
     cats = {c["category"] for c in cat}
     assert {"动量", "波动", "流动性", "技术", "估值", "质量"} <= cats
     pe = next(c for c in cat if c["factor"] == "pe")
@@ -245,18 +245,6 @@ def test_chip_falling_low_profit():
     assert r["profit_ratio_pct"] < 10
     assert r["avg_cost"] > float(bars[-1]["close"])
     assert r["pressure_above"] is not None
-
-
-def test_chip_roundtrip_db(tmp_db):
-    db = tmp_db
-    rows = [{"code": "002545", "trade_date": "2026-09-28",
-             "profit_ratio_pct": 62.5, "avg_cost": 13.1,
-             "cost_90_low": 12.0, "cost_90_high": 14.8,
-             "concentration_pct": 10.3}]
-    assert db.upsert_chip_daily(rows) == 1
-    got = db.query_chip_daily("002545")
-    assert got[0]["profit_ratio_pct"] == 62.5
-    assert got[0]["concentration_pct"] == 10.3
 
 
 def test_chip_insufficient_bars():

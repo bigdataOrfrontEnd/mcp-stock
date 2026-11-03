@@ -1,7 +1,7 @@
 """策略筛选引擎 — 两段式筛选：快照截面(数据层字段) + 计算层因子。
 
 分层边界（数据层→计算层→策略层）：
-- 快照段：market_snapshot 全市场截面行（db.query_market_snapshot 产出），
+- 快照段：全市场截面行（db.query_market_snapshot 从 quotes_daily 派生），
   硬过滤(hard_filters) + 截面分位打分(factor_weights)，便宜、覆盖全市场。
 - 计算层段：compute_filters / compute_weights 引用的因子名必须来自
   compute/factors.py 的 FACTOR_META 注册表（动量/波动/流动性/技术/估值/质量）。
@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 import yaml
 
+from ..compute import crosssec
 from ..compute import factors as F
 
 _PACKAGED_DIR = Path(__file__).resolve().parent / "strategies"
@@ -29,9 +30,14 @@ _USER_DIR = Path(os.environ.get(
 
 
 def load_strategies() -> dict[str, dict]:
-    """加载策略：用户版覆盖包内置版（同名）。"""
+    """加载策略：用户版覆盖包内置版（同名）。
+
+    同时同步到 SQLite strategies 注册表（数据治理单写入口：注册经 db.py），
+    DB 不可用时静默降级为纯文件模式。
+    """
     out: dict[str, dict] = {}
-    for d in (_PACKAGED_DIR, _USER_DIR):
+    sources: dict[str, str] = {}
+    for label, d in (("packaged", _PACKAGED_DIR), ("user", _USER_DIR)):
         if not d.exists():
             continue
         for p in sorted(d.glob("*.yaml")):
@@ -39,8 +45,15 @@ def load_strategies() -> dict[str, dict]:
                 s = yaml.safe_load(p.read_text(encoding="utf-8"))
                 if isinstance(s, dict) and s.get("name"):
                     out[s["name"]] = s
+                    sources[s["name"]] = label
             except yaml.YAMLError:
                 continue  # 坏文件跳过
+    try:
+        from ..data import db
+        db.sync_strategy_registry(
+            {n: (s, sources.get(n, "packaged")) for n, s in out.items()})
+    except Exception:
+        pass
     return out
 
 
@@ -77,17 +90,10 @@ def _passes(row: dict, hf: dict) -> bool:
 
 
 def _percentile(values: list[float], invert: bool) -> list[float]:
-    present = sorted(values)
-    n = len(present)
-    if n == 0:
-        return []
-
-    def one(v: float) -> float:
-        cnt = sum(1 for p in present if p <= v)
-        s = (cnt - 1) / (n - 1) * 100 if n > 1 else 50.0
-        return 100 - s if invert else s
-
-    return [one(v) for v in values]
+    """分位数学统一走 compute/crosssec（本层不自带实现）。"""
+    scores = crosssec.percentile_rank(values)
+    return [100 - s if (s is not None and invert) else s
+            for s in crosssec.neutral_fill(scores)]
 
 
 def _compute_stage(strategy: dict, pool: list[dict],
@@ -108,11 +114,21 @@ def _compute_stage(strategy: dict, pool: list[dict],
         raise ValueError(f"策略引用了计算层未注册的因子: {unknown}（见 factor_catalog）")
     values: dict[str, dict[str, float | None]] = {}
     has_bars: dict[str, bool] = {}
+    # 财务类因子（roe 等）需要财务指标输入：从 financial_indicators 取最新报告期
+    fin_keys = {k for k in keys if k in F.FACTOR_META and F.FACTOR_META[k]["input"] == "fin"}
+    fins: dict[str, dict] = {}
+    if fin_keys:
+        try:
+            from ..data import db
+            fins = db.latest_financials([r["code"] for r in pool])
+        except Exception:
+            fins = {}
     for r in pool:
         code = r["code"]
         bars = bars_get(code) if bars_get else None
         has_bars[code] = bool(bars)
-        values[code] = F.compute_factors(bars, keys) if bars else {k: None for k in keys}
+        values[code] = (F.compute_factors(bars, keys, fin=fins.get(code))
+                        if bars else {k: None for k in keys})
 
     scores: dict[str, dict[str, float | None]] = {}
     for k in keys:
@@ -160,15 +176,25 @@ def screen(rows: list[dict], strategy: dict, top_n: int = 10,
             col[i] = scores[j]
         col_scores[k] = col
 
+    # ---- 软打分段（soft_scores: 锚点区间，借鉴 AlphaSift ideal/chase 曲线） ----
+    # 格式: {字段: {full: [lo,hi], hard: [lo_h,hi_h], weight: w}}
+    #   —— 与 weights 并入同一加权合成（百分比/量比等"过热惩罚"类字段的正确姿势）
+    soft: dict[str, dict] = strategy.get("soft_scores") or {}
+    for k, cfg in soft.items():
+        vals_raw = [r.get(k) for r in kept]
+        scores = crosssec.anchor_score(vals_raw,
+                                       full=tuple(cfg["full"]),
+                                       hard=tuple(cfg["hard"]))
+        col_scores[k] = crosssec.neutral_fill(scores)
+        weights = {**weights, k: float(cfg.get("weight", 1.0))}
+
     snap_ranking = []
+    # 加权合成统一走 compute/crosssec（缺失因子按剩余权重归一）
+    score_rows = [{k: col_scores.get(k, [None] * len(kept))[i] for k in weights}
+                  for i in range(len(kept))]
+    composites = crosssec.weighted_composite(score_rows, weights)
     for i, r in enumerate(kept):
-        num, den = 0.0, 0.0
-        for k, w in weights.items():
-            s = col_scores.get(k, [None] * len(kept))[i]
-            if s is not None:
-                num += s * w
-                den += w
-        composite = round(num / den, 1) if den else None
+        composite = composites[i]
         snap_ranking.append({
             "code": r["code"], "name": r.get("name"), "close": r.get("close"),
             "change_pct": r.get("change_pct"), "amount": r.get("amount"),
@@ -183,7 +209,8 @@ def screen(rows: list[dict], strategy: dict, top_n: int = 10,
                 "ranking": snap_ranking[:top_n]}
 
     # ---- 计算层段 ----
-    pool = snap_ranking[: (pool_size or max(top_n * 5, 50))]
+    # 计算层池：K线已本地全量，扩大池子避免"合格但排名靠后"的票被漏掉
+    pool = snap_ranking[: (pool_size or max(top_n * 5, 200))]
     values, f_scores, has_bars = _compute_stage(strategy, pool, bars_get)
 
     # compute_filters 硬过滤：有K线但因子值缺失/越界 → 淘汰；
@@ -208,16 +235,11 @@ def screen(rows: list[dict], strategy: dict, top_n: int = 10,
         (survivors if ok else dropped).append(x)
 
     w_snap, w_comp = sum(weights.values()), sum(cw.values()) or 1.0
+    comp_rows = [{k: f_scores[x["code"]].get(k) for k in cw} for x in survivors]
+    comp_scores = crosssec.weighted_composite(comp_rows, cw)
     out = []
-    for x in survivors:
+    for x, comp_score in zip(survivors, comp_scores):
         code = x["code"]
-        num, den = 0.0, 0.0
-        for k, w in cw.items():
-            s = f_scores[code].get(k)
-            if s is not None:
-                num += s * w
-                den += w
-        comp_score = round(num / den, 1) if den else None
         snap = x["composite"]
         if comp_score is not None and snap is not None and w_snap > 0:
             final = round((snap * w_snap + comp_score * w_comp) / (w_snap + w_comp), 1)

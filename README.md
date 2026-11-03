@@ -24,12 +24,12 @@
 - 🎯 **策略漏斗** — YAML 策略筛选 → 趋势终审 → 排雷 → ATR 定仓，一键输出候选包
 - 📈 **板块轮动** — 90 个同花顺行业指数 N 日排行 vs 大盘基准
 - 🔄 **推荐闭环** — 落库推荐 → 真实入场价后验（涨停顺延开盘、连续一字作废）→ 分策略胜率归因
-- 📦 **20 张表 / 33 个 Tool** — eod 定时 14 步全自动，幂等可重跑
+- 📦 **19 张表 / 35 个 Tool** — eod 定时 15 步全自动，幂等可重跑
 
 ### 🏗️ 架构
 
 ```
-server.py — 33 个 MCP Tool
+server.py — 35 个 MCP Tool
 ├── data/       数据层（8 客户端 + 20 张表唯一写入口）
 │     tencent / baostock / akshare / 新浪财务 / 三源新闻 / 东财备源
 ├── compute/    计算层（纯函数零网络：缠论/指标/因子/筹码/异动/趋势/仓位/龙头）
@@ -38,16 +38,16 @@ server.py — 33 个 MCP Tool
 └── refresh.py  编排层（eod 每日14步 / weekly / 12个CLI任务）
 ```
 
-### 🛠️ Tools 一览（33 个）
+### 🛠️ Tools 一览（35 个）
 
 | 分组 | Tools |
 |------|-------|
 | 行情 | get_stock_quote / search_stock / main_fund_rank / sector_fund_flow / get_kline |
 | 研究计算 | get_indicators / get_chan_analysis / get_chip_distribution / trend_score / position_plan / factor_rank / factor_catalog |
 | 推荐漏斗 | list_strategies / screen / **run_pipeline** / scan_dragons / screen_runs |
-| 情绪事件 | get_zt_pool / get_lhb / get_earnings_forecast / sector_rotation |
+| 情绪事件 | get_zt_pool / get_lhb / get_earnings_forecast / sector_rotation / get_sector_flow（行业+概念资金流） |
 | 基础数据 | get_news / get_stock_concepts / get_concept_members / get_stock_industry / get_financial_indicator |
-| 闭环管理 | manage_watchlist / check_alerts / refresh_daily / save_recommendation / get_recommendation_stats / save_report / list_reports |
+| 闭环管理 | manage_watchlist / check_alerts / refresh_daily / save_recommendation / get_recommendation_stats / **get_decision_history**（同票决策档案+α+教训回注） / save_report / list_reports |
 
 ### 🚀 快速开始
 

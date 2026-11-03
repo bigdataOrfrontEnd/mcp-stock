@@ -1,0 +1,25 @@
+# 回踩年线（InStock backtrace_ma250 移植）：上破250日线后高位缩量回踩
+name: pullback_ma250
+display_name: 回踩年线
+description: 年线上方缩量回踩（回撤<20%、间隔10-50日、缩量2倍以上）的长线低吸候选（需310+根K线）
+version: "1.0"
+style: 低吸
+market_regime: [neutral, rotation]
+hard_filters:
+  exclude_st: true
+  amount_min: 100000000
+  price_min: 3
+  total_mv_min: 50
+factor_weights:
+  mom60: 0.30
+  turnover_rate: 0.20
+  amount: 0.15
+soft_scores:
+  change_pct: {full: [-5.0, 0.0], hard: [-8.0, 2.0], weight: 0.20}   # 回踩日温和下跌最优
+  volume_ratio: {full: [0.4, 0.9], hard: [0.1, 2.0], weight: 0.15}   # 缩量回踩
+compute_filters:
+  backtrace_ma250: {min: 100}    # 核心：回踩年线形态成立
+compute_weights:
+  ma30_slope: 0.35
+  mom60: 0.35
+  vol20: 0.30                    # 低波动优先（反向）

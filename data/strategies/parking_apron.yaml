@@ -1,0 +1,26 @@
+# 停机坪（InStock parking_apron 移植）：放量涨停后3日高开横盘不破涨停价
+name: parking_apron
+display_name: 停机坪
+description: 近15日放量涨停后连续3日高开缩幅横盘、收盘不破涨停价——强势整理待二次启动
+version: "1.0"
+style: 打板/低吸
+market_regime: [risk_on, rotation]
+hard_filters:
+  exclude_st: true
+  amount_min: 200000000
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  turnover_rate: 0.30
+  amount: 0.20
+  volume_ratio: 0.20
+soft_scores:
+  change_pct: {full: [-2.0, 3.0], hard: [-6.0, 6.0], weight: 0.15}
+  volume_ratio: {full: [0.5, 1.5], hard: [0.2, 3.0], weight: 0.15}
+compute_filters:
+  parking_apron: {min: 100}      # 核心：停机坪形态成立
+  recent_crash: {max: 0}         # 横盘期无破位（形态内已含，双保险）
+compute_weights:
+  ma30_slope: 0.40
+  mom20: 0.35
+  breakout_recent: 0.25

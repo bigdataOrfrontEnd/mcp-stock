@@ -1,14 +1,38 @@
-# DSH 插件定时任务配置（数据层每日/每周刷新）
+# DSH 定时任务配置（eod 每日 / weekly 每周 / history 一次性）
 
-> 目标：用 DSH 的定时任务插件（而非 launchd）驱动 `python -m mcp_eastmoney.refresh`，
-> 让数据落库跟随 DSH 生命周期管理。
->
-> 两个插件二选一。**注意**：以下 YAML 的字段名以各插件 README 为准（社区插件
-> Developer Preview 阶段配置结构可能调整），若校验失败，对照插件文档微调 key 即可。
+> 数据层跟随 DSH 生命周期：`python -m mcp_eastmoney.refresh <task>`。
+> 写入 DSH 的 profile patch（`$DSH_HOME/cordis.patch.yml` 或你的 preset），改配置需重启 dsh 并新建会话。
 
-## 方案 A（推荐）：@weibaohui/dsh-tasks — 直接执行命令
+## 任务总览
 
-写入 DSH 的 profile patch（`$DSH_HOME/cordis.patch.yml` 或你的 preset `agent.cordis.yml`）：
+| 任务 | 频率 | 内容 |
+|---|---|---|
+| `eod` | 每交易日 16:10 | 15 步全自动（见下），幂等可重跑，含补跑自查 |
+| `weekly` | 每周一 08:30 | stock_basic + stock_industry（Baostock 周一更新） |
+| `history` | **一次性**（手动） | 全市场日K回填 550 自然日（≈370 交易日），断点续跑，已有 ≥200 根自动跳过 |
+
+### eod 的 15 步（按执行顺序）
+
+```
+ 1 daily      自选股日K+15分钟线增量
+ 2 index      大盘指数（时间基准）
+ 3 ind_index  90 个同花顺行业指数
+ 4 lhb        龙虎榜
+ 5 forecast   业绩预告
+ 6 fin        自选股财务指标
+ 7 concepts   概念快照
+ 8 ztpool     涨停池
+ 9 zt_kline   当日涨停池K线补拉
+10 dragon     龙头扫描存档
+11 review     推荐后验（pnl + 相对上证 α）
+12 sector     板块资金流（行业+概念，东财 push2 直连）
+13 news       大盘新闻
+14 snapshot   全市场行情 → quotes_daily 当日K线（唯一真相源；截面由它派生；
+               point-in-time：盘前刷新打 T-1 标签；含市值/量比所需的量价字段）
+15 prune      库瘦身：fetch_log 留 30 天 / 15min 线留 30 天
+```
+
+## 方案 A（推荐）：@weibaohui/dsh-tasks
 
 ```yaml
 - insert:
@@ -16,25 +40,29 @@
       name: '@weibaohui/dsh-tasks'
       config:
         tasks:
-          # 每个交易日 16:10 收盘后全套：自选股日K+15分钟线+概念快照（含补跑自查）
+          # 每交易日 16:10 收盘后全套（含补跑自查与库瘦身）
           - id: stock-eod
             schedule: "10 16 * * 1-5"
             command: |
-              cd <项目根目录> &&
+              cd /Users/bianyingjie/Desktop/mcp-eastmoney &&
               .venv/bin/python -m mcp_eastmoney.refresh eod
             env:
-              STOCK_DB_PATH: ~/.dsh-stock/stock.db
-          # 每周一 08:30：基础信息 + 行业分类（Baostock 周一更新）
+              STOCK_DB_PATH: /Users/bianyingjie/Desktop/mcp-eastmoney/data/stock.db
+          # 每周一 08:30：基础信息 + 行业分类
           - id: stock-weekly
             schedule: "30 8 * * 1"
             command: |
-              cd <项目根目录> &&
+              cd /Users/bianyingjie/Desktop/mcp-eastmoney &&
               .venv/bin/python -m mcp_eastmoney.refresh weekly
             env:
-              STOCK_DB_PATH: ~/.dsh-stock/stock.db
+              STOCK_DB_PATH: /Users/bianyingjie/Desktop/mcp-eastmoney/data/stock.db
 ```
 
-## 方案 B：chicheng-cron — cron 表达式触发
+> `history` 回填**不进定时**——需要时手动跑一次（30-45 分钟，可中断续跑）：
+> `.venv/bin/python -m mcp_eastmoney.refresh history`
+> 回填完成后 15 个策略的 L1.5/L2 即对全市场有效（验收：`uv run python -m mcp_eastmoney.audit`）。
+
+## 方案 B：chicheng-cron
 
 ```yaml
 - insert:
@@ -44,38 +72,17 @@
         jobs:
           - name: stock-eod
             cron: "10 16 * * 1-5"
-            command: "cd <项目根目录> && .venv/bin/python -m mcp_eastmoney.refresh eod"
+            command: "cd /Users/bianyingjie/Desktop/mcp-eastmoney && .venv/bin/python -m mcp_eastmoney.refresh eod"
           - name: stock-weekly
             cron: "30 8 * * 1"
-            command: "cd <项目根目录> && .venv/bin/python -m mcp_eastmoney.refresh weekly"
-```
-
-## MCP Server 挂载（同一份 patch 里并列添加）
-
-```yaml
-- insert:
-    - id: stock-data-mcp
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: stock-data
-        transport: stdio
-        command: uv
-        args: ['run', 'mcp-eastmoney']
-        cwd: <项目根目录>
-        failOnStartupError: true
-        env:
-          STOCK_DB_PATH: ~/.dsh-stock/stock.db
+            command: "cd /Users/bianyingjie/Desktop/mcp-eastmoney && .venv/bin/python -m mcp_eastmoney.refresh weekly"
 ```
 
 ## 注意事项
 
-1. **必须新建空白 Session** 才能加载新配置；旧 Session 看不到新工具。
-2. **DSH 关闭期间错过的窗口不会自动补跑**——`refresh eod` 开头有自查逻辑
-   （读 `fetch_log` 最后 success 时间），日 K 增量拉取天然补齐缺失日期；
-   但 **15 分钟线错过不可补**，只能补到 Baostock 回溯窗口内的近日。
-3. 日志：任务 stdout 会进插件日志；审计记录在 `~/.dsh-stock/stock.db` 的 `fetch_log` 表：
-   `sqlite3 ~/.dsh-stock/stock.db "SELECT task,status,created_at FROM fetch_log ORDER BY id DESC LIMIT 10"`
-4. 手动触发验证（不等定时）：
-   `cd <项目根目录> && .venv/bin/python -m mcp_eastmoney.refresh eod`
-5. `eod` 对**自选股**落库——先用 MCP 工具 `manage_watchlist(action="add", code="600519")` 添加，
-   否则 eod 只刷概念快照。
+1. **新建空白 Session** 才能加载新配置。
+2. **错过窗口的补跑**：eod 开头读 `fetch_log` 自查；日K/daily_all 增量天然补齐缺失日期；**15 分钟线与概念快照错过不可补**。
+3. 审计：`sqlite3 data/stock.db "SELECT task,status,created_at FROM fetch_log ORDER BY id DESC LIMIT 10"`
+4. 手动验证：`.venv/bin/python -m mcp_eastmoney.refresh eod`
+5. eod 第 1/2/7 步作用于**自选池**——用 `manage_watchlist(action="add", code=...)` 添加；`screen(add_watchlist=true)` 也会自动入池。
+6. prune 是 eod 最后一步，只删"可再生数据"（旧日志/旧分时），**quotes_daily 与证据类表（screen_runs/recommendations/reviews/zt_pool/lhb）永不删**。

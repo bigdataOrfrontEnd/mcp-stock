@@ -2,7 +2,7 @@
 name: shrink_pullback
 display_name: 缩量回踩
 description: 缩量（量比<0.8）小幅回调（-5%~-1%）的活跃股，趋势未破的低吸候选
-version: "1.0"
+version: "1.2"
 style: 低吸
 hard_filters:
   exclude_st: true
@@ -19,12 +19,16 @@ factor_weights:
   amount: 0.20
   amplitude: 0.15
 inverted: [volume_ratio]
-# ---- 计算层因子（FACTOR_META 注册表，K线现算） ----
+# ---- 计算层段（FACTOR_META 注册表，K线现算）----
+# v1.1 修复：本文件曾有第二组重复的 compute_filters/compute_weights（YAML 重复键
+# 后者静默覆盖前者，丢失 ma20_dev 区间过滤与 vol20/price_pos_60 权重），已合并。
 compute_filters:               # 回调不破趋势：20日仍上行且贴近MA20
-  mom20: {min: 0}              # 20日动量仍为正（趋势未坏）
+  mom20: {min: 0}              # 20日动量仍为正（趋势未坏，排除下跌中继）
   ma20_dev: {min: -5, max: 3}  # 回踩贴近MA20但不深破
+  recent_crash: {max: 0}       # v1.2：排除灾害K线后的假回踩（放量下跌不是回踩）
 compute_weights:               # 两段分按权重融合（快照段合计1.0）
   mom20: 0.35
   ma20_dev: 0.20
   vol20: 0.15                  # 低波动优先（反向因子）
   price_pos_60: 0.30           # 处于60日区间中上部
+market_regime: [neutral, rotation]   # 震荡行情的主策略

@@ -1,0 +1,24 @@
+# 放量跌停（InStock climax_limitdown 移植）：恐慌宣泄日的观察/抄底候选
+name: climax_limitdown
+display_name: 放量跌停
+description: 跌>9.5%、成交额≥2亿、量能≥5日均量4倍——恐慌集中宣泄，次日博弈反抽（高风险，仅观察）
+version: "1.0"
+style: 低吸/左侧
+market_regime: [risk_off]
+hard_filters:
+  exclude_st: true
+  change_pct_max: -9.5           # 核心：跌停
+  change_pct_min: -20.0
+  amount_min: 200000000          # 核心：成交额≥2亿
+  volume_ratio_min: 4.0          # 核心：量能≥5日均量4倍
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  amount: 0.40
+  turnover_rate: 0.30
+  volume_ratio: 0.30
+compute_filters:
+  ma30_slope: {min: 0}           # 只在原趋势向上时博弈（下跌中继不接）
+compute_weights:
+  mom20: 0.50
+  ma30_slope: 0.50

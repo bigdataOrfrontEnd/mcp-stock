@@ -1,0 +1,29 @@
+# 无大幅回撤强趋势（InStock low_backtrace_increase 移植）
+# 注意：原文"涨幅小于0.6"实为突破策略判定（ratio_increase<0.6 return False），
+# 即要求 60 日涨幅 ≥60% 且途中无灾害K线——本移植忠实保留该语义。
+name: no_retrace_uptrend
+display_name: 无回撤强趋势
+description: 60日涨幅≥60%且全程无单日暴跌/两日连跌灾害的机构控盘式慢牛
+version: "1.0"
+style: 趋势
+market_regime: [risk_on]
+hard_filters:
+  exclude_st: true
+  amount_min: 200000000
+  price_min: 3
+  total_mv_min: 50
+factor_weights:
+  mom20: 0.30
+  turnover_rate: 0.20
+  amount: 0.15
+soft_scores:
+  change_pct: {full: [0.0, 5.0], hard: [-3.0, 9.0], weight: 0.20}
+  volume_ratio: {full: [0.8, 2.0], hard: [0.3, 5.0], weight: 0.15}
+compute_filters:
+  mom60: {min: 60}               # 核心：60日涨幅 ≥60%
+  recent_crash: {max: 0}         # 核心：全程无灾害K线（-7%/-10%判定）
+  ma30_slope: {min: 10}          # 趋势稳定性
+compute_weights:
+  mom60: 0.40
+  ma30_slope: 0.30
+  vol20: 0.30                    # 低波动=上涨质量（反向）

@@ -1,0 +1,30 @@
+# 基本面选股（InStock 基本面条件移植）：PE 0~20、PB≤10、ROE≥15
+# 限制：roe 因子来自 financial_indicators（新浪财务，eod fin 任务覆盖 watchlist），
+# 覆盖外的股票 roe=None → compute 段自动降级为纯估值过滤（不误杀，但也不加质量分）。
+name: value_quality
+display_name: 基本面优选
+description: 0<PE≤20、PB≤10、ROE≥15 的质量价值票（ROE 依赖财务指标覆盖度）
+version: "1.0"
+style: 低吸/防守
+market_regime: [risk_off, range_bound]
+hard_filters:
+  exclude_st: true
+  pe_min: 0
+  pe_max: 20                      # 核心：0 < PE ≤ 20
+  pb_min: 0
+  pb_max: 10                      # 核心：PB ≤ 10
+  amount_min: 100000000
+  price_min: 3
+  total_mv_min: 50
+factor_weights:
+  pe: 0.40                        # 越低越好（inverted）
+  pb: 0.25
+  turnover_rate: 0.20
+  amount: 0.15
+inverted: [pe, pb]
+compute_filters:
+  roe: {min: 15}                  # 核心：ROE ≥15（覆盖缺失时该过滤降级跳过）
+compute_weights:
+  mom20: 0.30
+  vol20: 0.30
+  ma30_slope: 0.40

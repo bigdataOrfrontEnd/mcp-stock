@@ -87,7 +87,7 @@ def test_load_strategies_builtin():
     strategies = S.load_strategies()
     assert {"volume_breakout", "dual_low", "shrink_pullback"} <= set(strategies)
     vb = strategies["volume_breakout"]
-    assert vb["hard_filters"]["volume_ratio_min"] == 2.0
+    assert vb["hard_filters"]["volume_ratio_min"] == 1.5  # v2: 软曲线接管上界
 
 
 def test_missing_field_filtered_out():
@@ -158,7 +158,7 @@ def test_compute_stage_drops_negative_momentum():
     assert "600003" not in [x["code"] for x in r["ranking"]]
 
 
-# ---- db: market_snapshot / screen_runs ------------------------------------------------
+# ---- db: 派生截面（quotes_daily）/ screen_runs ------------------------------------------
 
 
 @pytest.fixture()
@@ -171,18 +171,28 @@ def tmp_db(monkeypatch):
         yield db
 
 
-def test_snapshot_roundtrip(tmp_db):
+def test_derived_cross_section(tmp_db):
+    """quotes_daily 派生截面：量比/振幅由历史行现算，市值来自摄入列。"""
     db = tmp_db
-    rows = [{"code": "600519", "name": "贵州茅台", "price": 1500.0, "change_pct": 0.5,
-             "prev_close": 1492.5, "open": 1495.0, "high": 1510.0, "low": 1490.0,
-             "volume": 26366, "amount": 3.26e9, "turnover_rate": 0.21,
-             "volume_ratio": 0.94, "amplitude": 1.21, "pe": 18.97, "pb": 6.15,
-             "total_mv": 15445.76, "float_mv": 15445.76}]
-    assert db.upsert_market_snapshot(rows, "2026-09-29") == 1
-    got = db.query_market_snapshot("2026-09-29")
+    # 前5个交易日：每日成交量 100（股），收盘 10 元
+    from mcp_eastmoney.data.db import upsert_klines_daily
+    import pandas as pd
+    hist = pd.DataFrame([
+        {"code": "600519", "date": f"2026-09-2{i}", "open": 10, "high": 10.1,
+         "low": 9.9, "close": 10, "volume": 100, "amount": 1000,
+         "pctChg": 0, "turn": 1} for i in range(1, 6)])
+    upsert_klines_daily(hist)
+    rows = [{"code": "600519", "name": "贵州茅台", "price": 11.0, "change_pct": 10.0,
+             "open": 10.5, "high": 11.0, "low": 10.2,
+             "volume": 2, "amount": 3.26e9, "turnover_rate": 0.21,  # 2手 = 200股
+             "pe": 18.97, "pb": 6.15, "total_mv": 15445.76, "float_mv": 15445.76}]
+    assert db.upsert_snapshot_as_daily(rows, "2026-09-26") == 1
+    got = db.query_market_snapshot("2026-09-26")
     assert got[0]["code"] == "600519"
-    assert got[0]["pe"] == 18.97 and got[0]["volume_ratio"] == 0.94
-    assert db.snapshot_dates() == ["2026-09-29"]
+    assert got[0]["pe"] == 18.97 and got[0]["total_mv"] == 15445.76
+    assert got[0]["volume_ratio"] == 2.0           # 200 / 5日均量100
+    assert got[0]["amplitude"] == 8.0              # (11.0-10.2)/前收10*100
+    assert db.snapshot_dates()[0] == "2026-09-26"   # 截面日期 = 最新交易日
 
 
 def test_screen_runs_roundtrip(tmp_db):
@@ -252,3 +262,58 @@ def test_forecast_roundtrip(tmp_db):
     assert rows[0]["change_pct"] == -65.5
     rows2 = db.query_earnings_forecast(ftype="预增")
     assert rows2 == []
+
+
+# ---- AlphaSift 式锚点软打分 ----
+
+
+def test_anchor_score_curve():
+    from mcp_eastmoney.compute import crosssec
+    s = crosssec.anchor_score([2.5, 8.0, 0.5, 5.0, None, 6.5],
+                              full=(2.0, 5.0), hard=(0.0, 8.0))
+    assert s[0] == 100.0        # 满分区
+    assert s[1] == 0.0          # 上硬界
+    assert s[2] == 25.0        # 下衰减区中点(0.5在0~2之间)
+    assert s[3] == 100.0
+    assert s[4] is None         # 缺数据保持
+    assert 0 < s[5] < 100       # 衰减区（6.5 → (8-6.5)/3 ≈ 50）
+    assert abs(s[5] - 50.0) < 1
+
+
+def test_anchor_invalid_params():
+    from mcp_eastmoney.compute import crosssec
+    import pytest
+    with pytest.raises(ValueError):
+        crosssec.anchor_score([1.0], full=(5.0, 2.0), hard=(0.0, 8.0))
+
+
+def test_screener_soft_scores(tmp_db):
+    from mcp_eastmoney.recommend import screener as S
+    strat = {
+        "name": "t_soft", "hard_filters": {"exclude_st": True, "amount_min": 1e8},
+        "factor_weights": {"turnover_rate": 0.5},
+        "soft_scores": {"volume_ratio": {"full": [2.0, 3.0],
+                                         "hard": [1.0, 6.0], "weight": 0.5}},
+    }
+    rows = [
+        {"code": "600001", "name": "温和", "close": 10, "amount": 2e8,
+         "turnover_rate": 5.0, "volume_ratio": 2.5},      # 锚点满分
+        {"code": "600002", "name": "过热", "close": 10, "amount": 2e8,
+         "turnover_rate": 5.0, "volume_ratio": 6.0},      # 衰减到0
+        {"code": "600003", "name": "不足", "close": 10, "amount": 2e8,
+         "turnover_rate": 5.0, "volume_ratio": 1.0},      # 下界
+    ]
+    r = S.screen(rows, strat, top_n=3)
+    by = {x["code"]: x for x in r["ranking"]}
+    # 温和满分 > 过热(量比软分0) > 不足(下界0但换手同分) — 过热和不足均被压制
+    assert by["600001"]["composite"] > by["600002"]["composite"]
+    assert by["600001"]["composite"] > by["600003"]["composite"]
+
+
+def test_load_strategies_with_soft():
+    from mcp_eastmoney.recommend import screener as S
+    s = S.load_strategies()
+    vb = s["volume_breakout"]
+    assert "soft_scores" in vb and "change_pct" in vb["soft_scores"]
+    assert "oversold_reversal" in s              # 新策略已内置
+    assert s["oversold_reversal"]["soft_scores"]["change_pct"]["full"] == [-4.5, -2.5]

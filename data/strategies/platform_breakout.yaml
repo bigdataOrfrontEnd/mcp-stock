@@ -1,0 +1,27 @@
+# 突破平台（InStock breakthrough_platform 移植）：近20日放量上穿60日线站稳
+name: platform_breakout
+display_name: 平台突破
+description: 近20日存在放量上穿MA60且收盘站稳的突破日，突破前股价在60日线-5%~20%区间内整理
+version: "1.0"
+style: 趋势
+market_regime: [risk_on, rotation]
+hard_filters:
+  exclude_st: true
+  amount_min: 200000000
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  volume_ratio: 0.30
+  turnover_rate: 0.20
+  amount: 0.15
+soft_scores:
+  change_pct: {full: [1.5, 7.0], hard: [0.0, 9.8], weight: 0.20}
+  volume_ratio: {full: [2.0, 4.0], hard: [1.0, 8.0], weight: 0.15}
+compute_filters:
+  breakout_recent: {min: 100}    # 核心：近20日放量平台突破成立
+  ma30_slope: {min: 0}           # 突破方向向上
+  recent_crash: {max: 0}
+compute_weights:
+  mom20: 0.35
+  breakout_recent: 0.35
+  ma30_slope: 0.30

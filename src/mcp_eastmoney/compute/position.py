@@ -66,3 +66,12 @@ def position_size(entry: float, stop_loss: float, capital: float = 100_000.0,
         "notes": notes,
         "note": "风险预算法定仓位，供参考不构成投资建议",
     }
+
+
+def atr_stop(entry: float, atr14: float | None, mult: float = 2.0,
+             fallback_pct: float = 6.0) -> float:
+    """ATR 止损价公式（漏斗 L4 的唯一来源）：entry - mult×ATR；ATR 缺失时
+    回退固定百分比。"""
+    if atr14:
+        return round(entry - mult * atr14, 2)
+    return round(entry * (1 - fallback_pct / 100), 2)

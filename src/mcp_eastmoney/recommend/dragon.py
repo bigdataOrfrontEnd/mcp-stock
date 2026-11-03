@@ -5,6 +5,7 @@ eod 每日自动扫描存档（screen_runs, strategy=dragon_v1），tool 实时�
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ..compute import dragon as D
@@ -69,6 +70,43 @@ def _sector_context_for(zt_rows: list[dict], ctx: dict[str, dict]) -> dict[str, 
             for r in zt_rows if r.get("industry")}
 
 
+async def _m15_map_for(codes: list[str]) -> dict[str, list[dict]]:
+    """涨停池 15 分钟线：库优先，缺则新浪现拉并落库（错过不可补，盘中抓到就是赚到）。
+
+    返回 {code: 升序 bars（datetime/open/high/low/close/volume）}。
+    """
+    from ..data import tencent_client
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
+    out: dict[str, dict] = {}
+    missing = []
+    for c in codes:
+        rows = db.query_klines_15m(c, limit=16)   # 16根=全天
+        bars = list(reversed(rows))
+        # 新鲜度检查：库内 16 根须含今日（否则"早盘冲击力"用的是旧数据）
+        fresh = len(bars) >= 5 and str(bars[-1]["datetime"]).startswith(today)
+        if fresh:
+            out[c] = [{"datetime": b["datetime"], "open": b["open"], "high": b["high"],
+                       "low": b["low"], "close": b["close"], "volume": b["volume"]}
+                      for b in bars]
+        else:
+            missing.append(c)
+    for c in missing:
+        try:
+            bars = await tencent_client.get_kline_15m(c, datalen=16)
+            if len(bars) >= 5:
+                out[c] = bars
+                db.upsert_klines_15m([{"code": c, **b} for b in bars])
+            await asyncio.sleep(0.2)
+        except Exception:
+            continue  # 单只失败不阻断
+    return out
+
+
+# 早盘冲击力的数学实现已下沉 compute/dragon.py（分层修正：推荐层不含公式）
+from ..compute.dragon import early_impulse as _early_impulse  # noqa: F401
+
+
 async def scan_dragons(top: int = 5, persist: bool = False,
                        fetch_history: bool = True) -> dict[str, Any]:
     """扫描当日（或最新快照日）涨停池，识别真龙。"""
@@ -107,6 +145,32 @@ async def scan_dragons(top: int = 5, persist: bool = False,
         mom5_map[c] = _pct(closes, 5)
 
     sector_ctx = _sector_context_for(zt_rows, _sector_context(date_iso))
+
+    # 承接的自有代理：板块近5个交易日日均涨停家数（zt_pool 历史聚合，不依赖THS名称匹配）
+    sector_abs: dict[str, float] = {}
+    con = db._conn()
+    try:
+        rows_abs = con.execute(
+            """
+            SELECT industry, AVG(c) FROM (
+                SELECT industry, trade_date, COUNT(*) c FROM zt_pool
+                WHERE industry IS NOT NULL AND trade_date <= ?
+                GROUP BY industry, trade_date
+                ORDER BY trade_date DESC LIMIT 200
+            ) GROUP BY industry
+            """, (date_iso,)).fetchall()
+        for ind, cnt in rows_abs:
+            if ind:
+                sector_abs[ind] = round(cnt, 2)
+    finally:
+        con.close()
+
+    # 当日行情行（一字判定 + 振幅）：由 quotes_daily 当日行派生（v3 起唯一真相源）
+    snap_map: dict[str, dict] = {}
+    for r in db.query_market_snapshot(date_iso) if date_iso else []:
+        snap_map[r["code"]] = {"open": r.get("open"), "high": r.get("high"),
+                               "low": r.get("low"), "amplitude": r.get("amplitude")}
+
     # 大盘基准：上证指数最新涨幅（腾讯兜底行可能缺 change_pct → 用前收推算）
     bench_rows = db.query_index_daily("sh.000001", limit=2)
     broad = None
@@ -118,7 +182,18 @@ async def scan_dragons(top: int = 5, persist: bool = False,
             broad = round((b["close"] / bench_rows[1]["close"] - 1) * 100, 2)
     bench = {"broad": broad, "sector_default": None}
 
-    ranked = D.score_dragons(zt_rows, mom5_map, sector_ctx, bench)
+    # 15分钟线 → 早盘冲击力（带动性的分钟级升级；缺失自动回退 v2 权重）
+    m15_map: dict[str, list[dict]] = {}
+    if fetch_history:
+        try:
+            m15_map = await _m15_map_for([r["code"] for r in zt_rows])
+        except Exception:
+            m15_map = {}
+    impulse_map = {c: _early_impulse(b) for c, b in m15_map.items()}
+
+    ranked = D.score_dragons(zt_rows, mom5_map, sector_ctx, bench,
+                             snap_map=snap_map, sector_abs=sector_abs,
+                             impulse_map=impulse_map)
     dragons = [x for x in ranked if x["is_true_dragon"]][:top]
     result = {
         "date": date_iso, "strategy": "dragon_v1",

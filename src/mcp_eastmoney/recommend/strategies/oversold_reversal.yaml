@@ -1,0 +1,34 @@
+# 超跌反转（移植 AlphaSift oversold_reversal）：跌幅可控+流动性在+具备修复观察价值
+name: oversold_reversal
+display_name: 超跌反转
+description: 跌幅可控（理想-3.5%锚点）、流动性仍在的超跌修复候选，左侧反转观察
+version: "1.0"
+style: 低吸/左侧
+market_regime: [risk_off, range_bound]   # 弱市反弹日的专用策略
+hard_filters:
+  exclude_st: true
+  amount_min: 80000000
+  turnover_rate_min: 1.0
+  change_pct_min: -8.0
+  change_pct_max: -1.0
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  turnover_rate: 0.20
+  amount: 0.15
+soft_scores:
+  change_pct:                # AlphaSift reversal_ideal：-3.5% 最优锚点，浅跌深跌都衰减
+    full: [-4.5, -2.5]
+    hard: [-8.0, -1.0]
+    weight: 0.40
+  volume_ratio:              # 缩量下跌优先（恐慌抛售 vs 无量阴跌）
+    full: [0.5, 1.0]
+    hard: [0.2, 2.5]
+    weight: 0.25
+compute_filters:              # 已跌回价值区才值得关注（非下跌中继）
+  ma20_dev:
+    min: -15
+    max: 5
+compute_weights:
+  rsi14: 0.5
+  mom20: 0.5

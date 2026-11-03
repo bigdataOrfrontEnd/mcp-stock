@@ -1,0 +1,28 @@
+# 低ATR成长（InStock low_atr 移植）：上市250日+，近10日高低收盘差>110%（活跃成长股筛选）
+# 说明：原版 ATR 判定（日均绝对涨跌幅≤10%）近似用 vol20 波动率上限代替；核心条件是区间振幅。
+name: low_atr_growth
+display_name: 低ATR成长
+description: 上市满250日、近10日最高/最低收盘差≥110% 的活跃票（InStock 原判定忠实移植）
+version: "1.0"
+style: 趋势
+market_regime: [risk_on]
+hard_filters:
+  exclude_st: true
+  amount_min: 100000000
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  mom20: 0.30
+  turnover_rate: 0.25
+  volume_ratio: 0.20
+soft_scores:
+  change_pct: {full: [0.0, 6.0], hard: [-3.0, 9.5], weight: 0.13}
+  volume_ratio: {full: [1.0, 3.0], hard: [0.3, 6.0], weight: 0.12}
+compute_filters:
+  range_10: {min: 110}           # 核心：近10日区间振幅 ≥110%
+  vol20: {max: 10}               # 近似原版 ATR≤10（日波动率上限）
+  recent_crash: {max: 0}
+compute_weights:
+  range_10: 0.40
+  mom20: 0.35
+  ma30_slope: 0.25

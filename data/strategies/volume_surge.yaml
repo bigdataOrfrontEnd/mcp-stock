@@ -1,0 +1,28 @@
+# 放量上涨（InStock enter.check_volume 移植）：最简构件策略
+name: volume_surge
+display_name: 放量上涨
+description: 涨≥2%、阳线、成交额≥2亿、量能≥5日均量2倍——资金进场的基础信号（其他突破类策略的构件）
+version: "1.0"
+style: 趋势
+market_regime: [risk_on, rotation]
+hard_filters:
+  exclude_st: true
+  change_pct_min: 2.0            # 核心：涨幅 ≥2%
+  amount_min: 200000000          # 核心：成交额 ≥2亿
+  volume_ratio_min: 2.0          # 核心：量能 ≥5日均量2倍
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  volume_ratio: 0.35
+  turnover_rate: 0.25
+  amount: 0.20
+soft_scores:
+  change_pct: {full: [2.0, 7.0], hard: [2.0, 9.8], weight: 0.10}    # 不奖励涨停式追高
+  volume_ratio: {full: [2.0, 4.0], hard: [2.0, 8.0], weight: 0.10}
+compute_filters:
+  recent_crash: {max: 0}         # 放量上涨而非放量出逃：排除灾害后反抽
+  ma30_slope: {min: 0}
+compute_weights:
+  mom20: 0.40
+  ma30_slope: 0.35
+  breakout_recent: 0.25

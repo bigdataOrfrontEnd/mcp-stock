@@ -279,6 +279,28 @@ async def get_zt_pool(
 
 
 @app.tool(
+    name="market_sentiment",
+    description=(
+        "情绪周期定量标签（基于本地 zt_pool 历史，纯计算不现拉）。Quantified market "
+        "sentiment label: 发酵期/高潮期/分歧期/退潮期。date: YYYYMMDD 默认最新快照日。"
+        "判定规则（今日 vs 上一快照日）：①最高连板较昨日回落≥4 → 分歧期(高度断层)；"
+        "②涨停总数↑ 且 二板以上家数↑ → 高潮期；③总数↑ 且 二板以上↓ → 发酵期；"
+        "④总数↓ 且 二板以上↑ → 分歧期；⑤总数↓ 且 二板以上↓ → 退潮期。"
+        "返回 metrics 双日对比与 rationale，供'弱市低吸过滤'等纪律做硬判定。"
+    ),
+)
+async def market_sentiment(date: str = "") -> str:
+    """Classify market sentiment phase from local zt_pool history (no live fetch)."""
+    from .compute.sentiment import sentiment_from_db
+    if date:
+        if not (len(date) == 8 and date.isdigit()):
+            return _d({"error": f"date 应为 YYYYMMDD，收到: {date!r}"})
+        iso = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        return _d(sentiment_from_db(db, iso))
+    return _d(sentiment_from_db(db))
+
+
+@app.tool(
     name="save_recommendation",
     description=(
         "保存一条AI股票推荐到本地库（推荐后必须调用，用于后续绩效验证与复盘进化）。"
@@ -320,12 +342,24 @@ async def save_recommendation(
         name = row[0] if row else None
     finally:
         con.close()
+    # 策略参数快照（数据治理：skill_version 匹配已注册策略时自动附上，
+    # 后验归因可精确到"当时用的哪版参数"，参数后续修改不影响历史）
+    strategy_def = None
+    try:
+        from .recommend.screener import load_strategies
+        defs = load_strategies()
+        if skill_version in defs:
+            import json as _json
+            strategy_def = _json.dumps(defs[skill_version], ensure_ascii=False)
+    except Exception:
+        pass
     rid = db.insert_recommendation(
         c, name, thesis, concepts, style, entry, target_horizon,
-        max(1, min(5, confidence)), skill_version,
+        max(1, min(5, confidence)), skill_version, strategy_def=strategy_def,
     )
     return _d({"ok": True, "rec_id": rid, "code": c, "name": name,
                "entry_ref_price": entry, "skill_version": skill_version,
+               "strategy_snapshot": bool(strategy_def),
                "note": "eod 任务将每日自动评估绩效（T+1起，到期终评）"})
 
 
@@ -350,6 +384,25 @@ async def get_recommendation_stats(
                    "stats": db.recommendation_stats(group_by, days)})
     from .refresh import review_recommendations
     return _d(await review_recommendations())
+
+
+@app.tool(
+    name="get_decision_history",
+    description=(
+        "查询某只股票的历史决策档案：过往推荐记录 + 后验盈亏 + 相对上证指数同期 alpha + "
+        "终评教训。分析该股或再次推荐前必须调用，把'历史战绩与教训'注入当前判断"
+        "（TradingAgents 决策日志范式：同票历史决策回注，防止重复踩坑）。"
+        "Decision history for a stock: past recommendations, realized pnl, "
+        "benchmark alpha, and lessons from final reviews."
+    ),
+)
+async def get_decision_history(code: str, limit: int = 20) -> str:
+    """Same-ticker decision log with pnl, alpha and lessons."""
+    try:
+        c = normalize(code)
+    except ValueError as e:
+        return _d({"error": str(e)})
+    return _d(db.decision_history(c, limit))
 
 
 @app.tool(
@@ -383,24 +436,40 @@ async def _get_bars(code: str, limit: int = 250) -> tuple[list[dict], str]:
     """取升序日K：库优先，不足则 Baostock 现拉落库。返回 (bars, source)。
 
     指数（'sh.000001' 式大盘码或 88 开头行业码）路由 index_daily，不再混入个股表。
+    新鲜度：末根K线日期 < 库内大盘最新日时，source 追加 stale 标记
+    （提示调用方指标基于旧数据，停牌股天然允许滞后）。
     """
+    latest = db.get_last_index_date("sh.000001") or ""
     if "." in code or code.startswith("88"):
         rows = db.query_index_daily(code, limit=limit)
-        return list(reversed(rows)), ("local_index" if rows else "local_empty")
+        bars = list(reversed(rows))
+        src = "local_index" if rows else "local_empty"
+        if bars and bars[-1]["date"] < latest:
+            src += "(stale)"   # 行业指数 THS T+1 发布，常见滞后一天
+        return bars, src
     rows = db.query_klines_daily(code, limit=limit)
     bars = list(reversed(rows))  # db 返回倒序 → 转升序
     if len(bars) >= min(limit, 120):
-        return bars, "local"
+        src = "local"
+        if bars and bars[-1]["date"] < latest:
+            src += "(stale)"
+        return bars, src
     from datetime import datetime as _dt
     from .data.baostock_client import query_kline as _qk
     start = (_dt.now() - timedelta(days=int(limit * 1.6))).strftime("%Y-%m-%d")
-    df = await _qk(code, "d", start=start)
-    df = df[df["tradestatus"] == "1"]
-    if not df.empty:
+    try:
+        df = await _qk(code, "d", start=start)
+        df = df[df["tradestatus"] == "1"]
+    except Exception:
+        df = None  # Baostock 异常 → 尽力返回库内
+    if df is not None and not df.empty:
         db.upsert_klines_daily(df)
         bars = list(reversed(db.query_klines_daily(code, limit=limit)))
         return bars, "baostock_fetched"
-    return bars, "local_insufficient"
+    src = "local_insufficient"
+    if bars and bars[-1]["date"] < latest:
+        src += "(stale)"
+    return bars, src
 
 
 def _resolve_code(code: str) -> tuple[str, bool]:
@@ -419,9 +488,10 @@ def _resolve_code(code: str) -> tuple[str, bool]:
 
 def _local_bars_get(code: str) -> list[dict] | None:
     """筛选计算层段用的本地K线注入（同步、只读本地库，不触发网络）。"""
-    rows = db.query_klines_daily(code, limit=250)
+    rows = db.query_klines_daily(code, limit=320)
     bars = list(reversed(rows))
-    return bars if len(bars) >= 30 else None
+    # 有行即返回（历史过短由因子判死）；无行才降级放行
+    return bars if bars else None
 
 
 @app.tool(
@@ -783,7 +853,7 @@ async def check_alerts(
     return _d(result)
 
 
-# ---- 策略筛选层（market_snapshot → 硬过滤+打分 → 候选池） -----------------------------
+# ---- 策略筛选层（quotes_daily 派生截面 → 硬过滤+打分 → 候选池） -----------------------
 
 
 @app.tool(
@@ -815,7 +885,7 @@ async def list_strategies() -> str:
 @app.tool(
     name="screen",
     description=(
-        "执行策略筛选：对最新全市场快照(market_snapshot)做硬过滤+因子打分，返回 Top N 候选。"
+        "执行策略筛选：对最新全市场截面（quotes_daily 最新日派生：含量比/振幅/市值）做硬过滤+因子打分，返回 Top N 候选。"
         "Run a screening strategy. add_watchlist=true 时把 Top N 自动加入自选池"
         "（eod 将自动为其拉取深历史）。save_run=true 存档本次运行（screen_runs 表）。"
         "无快照时自动现拉全市场（约1-2分钟）。策略清单见 list_strategies。"
@@ -883,22 +953,10 @@ async def run_pipeline(
 ) -> str:
     """Run the full screening pipeline and return a candidate pack."""
     from .recommend import pipeline as P
-    # 预处理：L1 候选中本地无深历史的 → Baostock 现拉落库（top_n 只，~2s/只）
-    if fetch_history:
-        try:
-            from .recommend import screener as S
-            strategies = S.load_strategies()
-            if strategy in strategies:
-                scr = S.screen(db.query_market_snapshot(), strategies[strategy], top_n)
-                missing = [r["code"] for r in scr["ranking"]
-                           if len(db.query_klines_daily(r["code"], limit=60)) < 30]
-                if missing:
-                    from .refresh import refresh_daily as _rd
-                    await _rd(missing, days=0)
-        except Exception:
-            pass  # 预取失败不阻断（pipeline 会把无K线的候选标记淘汰）
-    result = P.run_pipeline(strategy, top_n=top_n, min_trend_score=min_trend_score,
-                            capital=capital, risk_pct=risk_pct)
+    # pipeline 为 async：L2 遇缺K线候选当场补拉（Baostock→腾讯全量兜底）
+    result = await P.run_pipeline(strategy, top_n=top_n,
+                                  min_trend_score=min_trend_score,
+                                  capital=capital, risk_pct=risk_pct)
     if "error" in result:
         return _d(result)
     # 候选落库 screen_runs（复盘可查当时漏斗证据）
@@ -1055,6 +1113,75 @@ async def sector_rotation(days: int = 5, top_n: int = 10) -> str:
         bench = round((last / first - 1) * 100, 2)
     return _d({"days": days, "universe": len(uni), "benchmark_sh000001_pct": bench,
                "top": r["top"], "bottom": r["bottom"]})
+
+
+@app.tool(
+    name="get_sector_flow",
+    description=(
+        "板块资金流（行业/概念）：主力净流入排行 + 涨跌幅 + 领涨股 + 各单型净额。"
+        "Sector fund flow (industry/concept) for main-line judgment. "
+        "sector_type: industry/concept/both(默认both)；date: YYYY-MM-DD 默认最新；"
+        "sort: main_net(默认)/change_pct。每日 eod 落库（sector_flow 表）。"
+    ),
+)
+async def get_sector_flow(
+    sector_type: Literal["industry", "concept", "both"] = "both",
+    date: str = "", limit: int = 10,
+) -> str:
+    """Industry/concept fund-flow ranking from local sector_flow table."""
+    kinds = ["industry", "concept"] if sector_type == "both" else [sector_type]
+    out: dict = {"date": date or (db.sector_flow_dates(1) or [""])[0]}
+    for k in kinds:
+        out[k] = db.query_sector_flow(k, trade_date=date or None, limit=limit)
+    if not any(out.get(k) for k in kinds):
+        out["error"] = "本地无板块资金流数据，先运行 refresh sector"
+    return _d(out)
+
+
+@app.tool(
+    name="aggregate_scan",
+    description=(
+        "聚合扫描：15 个策略并行跑 L1→L2（每次运行存档 funnel_runs 可回溯），"
+        "合并成统一候选榜——标注共振数(≥2 策略命中优先)、所属行业、板块资金流排名、"
+        "情绪适配。Aggregate all strategy funnels into one ranked board. "
+        "排序规则透明：共振↓→板块资金流↑→趋势分↓，不做加权黑盒。"
+        "榜单是 AI 终审的入口：共振票优先深评 → 精选 ≤3 → save_recommendation。"
+    ),
+)
+async def aggregate_scan(top_n: int = 10, min_trend_score: float = 65.0) -> str:
+    """Run all strategy funnels (L2 exit) and aggregate into one ranked board."""
+    from .recommend.aggregate import aggregate_scan as _agg
+    result = await _agg(top_n=top_n, min_trend_score=min_trend_score)
+    return _d(result)
+
+
+@app.tool(
+    name="funnel_runs",
+    description=(
+        "查询历史漏斗运行存档（L1→L2 可回溯）：每次运行的收窄计数、L2 出口标的、"
+        "各级淘汰明细（code/stage/reason）。Historical funnel runs with full evidence. "
+        "strategy/run_date 可过滤。配合 aggregate_runs 榜单可完整回答"
+        "'当时为什么选出这些票、其他票死在哪一层'。"
+    ),
+)
+async def funnel_runs(strategy: str = "", run_date: str = "", limit: int = 10) -> str:
+    """Query archived funnel runs (L1-L2 traceability)."""
+    rows = db.query_funnel_runs(strategy or None,
+                                run_date or None, limit)
+    return _d({"count": len(rows), "runs": rows})
+
+
+@app.tool(
+    name="aggregate_runs",
+    description=(
+        "查询历史聚合榜存档：当日情绪、共振标注、榜单全文、关联的漏斗 run id。"
+        "Historical aggregated boards. 用于复盘'当天榜单 vs 后验表现'。"
+    ),
+)
+async def aggregate_runs(run_date: str = "", limit: int = 5) -> str:
+    """Query archived aggregate boards."""
+    rows = db.query_aggregate_runs(run_date or None, limit)
+    return _d({"count": len(rows), "runs": rows})
 
 
 # ---- Skill 层工具（报告归档；模板本体在 DSH skill：scratch-plugin/skills/） ----------

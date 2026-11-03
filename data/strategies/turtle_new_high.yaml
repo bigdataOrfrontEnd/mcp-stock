@@ -1,0 +1,27 @@
+# 海龟入场（InStock turtle_trade 移植）：收盘创60日新高 + 基础流动性
+name: turtle_new_high
+display_name: 海龟60日新高
+description: 收盘价创60日最高收盘价、趋势仍上行的动量突破票（海龟法则入场条件）
+version: "1.0"
+style: 趋势
+market_regime: [risk_on, rotation]
+hard_filters:
+  exclude_st: true
+  amount_min: 200000000
+  price_min: 3
+  total_mv_min: 30
+factor_weights:
+  mom20: 0.30
+  turnover_rate: 0.25
+  amount: 0.15
+soft_scores:
+  change_pct: {full: [1.0, 7.0], hard: [0.0, 9.8], weight: 0.15}
+  volume_ratio: {full: [1.5, 3.0], hard: [1.0, 6.0], weight: 0.15}
+compute_filters:
+  new_high_60: {min: 100}        # 核心：当日收盘 ≥ 近60日最高收盘
+  ma30_slope: {min: 0}           # 趋势方向保障
+  recent_crash: {max: 0}         # 近20日无灾害K线
+compute_weights:
+  mom20: 0.40
+  ma30_slope: 0.35
+  price_pos_60: 0.25
