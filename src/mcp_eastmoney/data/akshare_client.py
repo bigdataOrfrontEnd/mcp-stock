@@ -155,3 +155,54 @@ async def industry_index_kline(symbol: str, start: str, end: str) -> pd.DataFram
     """同花顺行业指数日K。symbol: 行业名（如 '半导体'）。列: 日期/开盘价/.../成交额。"""
     return await _t(ak.stock_board_industry_index_ths, symbol=symbol,
                     start_date=start, end_date=end)
+
+
+# ---- 板块资金流（同花顺源；东财 push2 断连时的 fallback） ---------------------------
+
+
+def _fnum(v) -> float | None:
+    """安全数值转换（'--'/空/异常 → None）。"""
+    try:
+        s = str(v).replace(",", "").strip()
+        if not s or s in {"--", "-", "nan", "None"}:
+            return None
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+async def sector_flow_raw(kind: str = "industry") -> list[dict]:
+    """同花顺行业/概念资金流（即时），对齐东财 sector_flow_raw 的行结构。
+
+    口径差异（重要）：
+    - "净额"为**全单口径**（无主力/超大/大/中/小单分解）→ 只填 main_net，
+      分解字段留 None；单位亿 → 换算成元（与东财一致）
+    - 同花顺无 BK 板块代码 → code 用行业/概念名（幂等键仍成立；
+      行业名与 sector_rotation 的同花顺行业体系一致，排名标注可直接对上）
+    """
+    def _sync() -> list[dict]:
+        df = (ak.stock_fund_flow_industry("即时") if kind == "industry"
+              else ak.stock_fund_flow_concept("即时"))
+        out: list[dict] = []
+        for _, r in df.iterrows():
+            name = str(r.get("行业") or "").strip()
+            if not name:
+                continue
+            net = _fnum(r.get("净额"))
+            out.append({
+                "code": name, "name": name,
+                "index_value": _fnum(r.get("行业指数")),
+                "change_pct": _fnum(r.get("行业-涨跌幅")),
+                "main_net": net * 1e8 if net is not None else None,
+                "main_net_pct": None,
+                "super_large_net": None, "super_large_pct": None,
+                "large_net": None, "large_pct": None,
+                "medium_net": None, "medium_pct": None,
+                "small_net": None, "small_pct": None,
+                "leader_name": str(r.get("领涨股") or "") or None,
+                "leader_code": None,
+                "data_ts": None,
+            })
+        return out
+
+    return await _t(_sync)

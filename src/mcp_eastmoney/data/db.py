@@ -191,6 +191,8 @@ CREATE TABLE IF NOT EXISTS recommendations (
     target_horizon INTEGER DEFAULT 5,
     confidence INTEGER,
     skill_version TEXT DEFAULT 'v1',
+    run_id INTEGER,                    -- 关联 funnel_runs.id（哪次运行选出，v8 可评估上下文）
+    risk_flags TEXT,                   -- JSON 数组：落表时风险标记（point-in-time，v8）
     status TEXT DEFAULT 'open',        -- open / final
     created_at TEXT
 );
@@ -248,21 +250,33 @@ CREATE TABLE IF NOT EXISTS funnel_runs (
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_funnel_date ON funnel_runs(run_date, strategy);
+-- 展开视图：funnel_runs 的 candidates JSON → 候选级明细（一只票一行）
+CREATE VIEW IF NOT EXISTS funnel_candidates AS
+SELECT r.id            AS run_id,
+       r.run_date      AS run_date,
+       r.strategy      AS strategy,
+       r.snapshot_date AS snapshot_date,
+       json_extract(c.value, '$.code')        AS code,
+       json_extract(c.value, '$.name')        AS name,
+       json_extract(c.value, '$.close')       AS close,
+       json_extract(c.value, '$.screen_score')AS screen_score,
+       json_extract(c.value, '$.trend_score') AS trend_score,
+       json_extract(c.value, '$.trend_grade') AS trend_grade,
+       json_extract(c.value, '$.snapshot.change_pct')    AS change_pct,
+       json_extract(c.value, '$.snapshot.amount')        AS amount,
+       json_extract(c.value, '$.snapshot.turnover_rate') AS turnover_rate,
+       json_extract(c.value, '$.snapshot.volume_ratio')  AS volume_ratio,
+       json_extract(c.value, '$.snapshot.pe')            AS pe,
+       json_extract(c.value, '$.snapshot.pb')            AS pb
+FROM funnel_runs r, json_each(r.candidates) c;
 
-CREATE TABLE IF NOT EXISTS aggregate_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_date TEXT NOT NULL,
-    sentiment_label TEXT,              -- 当日情绪（发酵/高潮/分歧/退潮）
-    sentiment_regime TEXT,             -- 映射的市况（risk_on/neutral/risk_off）
-    funnel_run_ids TEXT,               -- JSON：关联 funnel_runs.id 列表（证据链）
-    result TEXT,                       -- JSON：聚合榜单（共振/行业/资金流/排序）
-    created_at TEXT
-);
+-- aggregate_runs（v7 曾有的跨策略聚合存档）已随聚合层移除（2026-11-04）：
+-- 既有库中的表与历史数据保留不删（证据永不删），新库不再创建，代码不再读写。
 """
 
 
 # ---- schema 版本化迁移（唯一 DDL 演进入口；历史 ad-hoc ALTER 已折叠为 v1） ---------
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _migrate(c: sqlite3.Connection) -> None:
@@ -322,8 +336,20 @@ def _migrate(c: sqlite3.Connection) -> None:
         c.execute("DROP TABLE IF EXISTS concepts")
         v = 6
     if v < 7:
-        # v7（2026-11-03）：L1→L2 可回溯存档（funnel_runs）+ 聚合榜存档（aggregate_runs）
+        # v7（2026-11-03）：L1→L2 可回溯存档（funnel_runs；aggregate_runs 后随聚合层移除）
         v = 7
+    if v < 8:
+        # v8（2026-11-04）：推荐关联运行上下文（可评估上下文闭环）
+        # run_id → funnel_runs.id（哪次运行选出的）；risk_flags → 落表时的风险标记
+        for ddl in (
+            "ALTER TABLE recommendations ADD COLUMN run_id INTEGER",
+            "ALTER TABLE recommendations ADD COLUMN risk_flags TEXT",
+        ):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+        v = 8
     c.execute(f"PRAGMA user_version={v}")
 
 
@@ -903,21 +929,26 @@ def insert_recommendation(code: str, name: str | None, thesis: str,
                           concepts: str, style: str, entry_ref_price: float,
                           target_horizon: int, confidence: int,
                           skill_version: str, rec_date: str | None = None,
-                          strategy_def: str | None = None) -> int:
+                          strategy_def: str | None = None,
+                          run_id: int | None = None,
+                          risk_flags: str | None = None) -> int:
     """写入一条推荐记录，返回自增 id。
 
     strategy_def：推荐时刻策略参数的 JSON 快照（skill_version 匹配已注册策略时
     由 server 层自动附上）——策略参数后续修改不影响历史归因，飞轮可对比参数版本。
+    run_id：关联 funnel_runs.id（该票由哪次策略运行选出，证据链闭合）。
+    risk_flags：JSON 数组文本，落表时冻结的风险标记（point-in-time）。
     """
     c = _conn()
     try:
         cur = c.execute(
             "INSERT INTO recommendations (rec_date, code, name, thesis, concepts, style, "
-            "entry_ref_price, target_horizon, confidence, skill_version, strategy_def, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "entry_ref_price, target_horizon, confidence, skill_version, strategy_def, "
+            "run_id, risk_flags, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (rec_date or _now()[:10], code, name, thesis, concepts, style,
              entry_ref_price, target_horizon, confidence, skill_version,
-             strategy_def, _now()),
+             strategy_def, run_id, risk_flags, _now()),
         )
         c.commit()
         return cur.lastrowid
@@ -931,13 +962,16 @@ def recommendations_open() -> list[dict]:
     try:
         rows = c.execute(
             "SELECT id, rec_date, code, name, thesis, concepts, style, entry_ref_price, "
-            "target_horizon, confidence, skill_version FROM recommendations "
-            "WHERE status='open' ORDER BY rec_date"
+            "target_horizon, confidence, skill_version, run_id, risk_flags "
+            "FROM recommendations WHERE status='open' ORDER BY rec_date"
         ).fetchall()
+        import json as _json
         return [
             {"id": r[0], "rec_date": r[1], "code": r[2], "name": r[3], "thesis": r[4],
              "concepts": r[5], "style": r[6], "entry_ref_price": r[7],
-             "target_horizon": r[8], "confidence": r[9], "skill_version": r[10]}
+             "target_horizon": r[8], "confidence": r[9], "skill_version": r[10],
+             "run_id": r[11],
+             "risk_flags": _json.loads(r[12]) if r[12] else None}
             for r in rows
         ]
     finally:
@@ -1064,12 +1098,13 @@ def decision_history(code: str, limit: int = 20) -> dict:
     每条历史推荐附最新后验盈亏与相对基准（sh.000001 上证指数）同期 alpha，
     汇总胜负与教训（final 终评 note），供分析/推荐前注入"该股历史战绩与教训"。
     """
+    import json as _json
     c = _conn()
     try:
         recs = c.execute(
             "SELECT id, rec_date, code, name, thesis, style, entry_ref_price, "
-            "target_horizon, confidence, skill_version, status FROM recommendations "
-            "WHERE code=? ORDER BY id DESC LIMIT ?", (code, limit),
+            "target_horizon, confidence, skill_version, status, run_id, risk_flags "
+            "FROM recommendations WHERE code=? ORDER BY id DESC LIMIT ?", (code, limit),
         ).fetchall()
         bench = {r[0]: r[1] for r in c.execute(
             "SELECT trade_date, close FROM index_daily WHERE code='sh.000001'")}
@@ -1096,6 +1131,8 @@ def decision_history(code: str, limit: int = 20) -> dict:
                 "id": r[0], "rec_date": r[1], "code": r[2], "name": r[3],
                 "thesis": r[4], "style": r[5], "entry": r[6], "horizon": r[7],
                 "confidence": r[8], "skill_version": r[9], "status": r[10],
+                "run_id": r[11],
+                "risk_flags": (_json.loads(r[12]) if r[12] else None),
                 "latest_review": ({"eval_date": v[0], "days_held": v[1],
                                    "close": v[2], "pnl_pct": pnl,
                                    "hit_target": v[4]} if v else None),
@@ -1458,7 +1495,7 @@ def sector_flow_dates(limit: int = 10) -> list[str]:
         c.close()
 
 
-# ---- funnel_runs / aggregate_runs（L1→L2 可回溯 + 聚合存档，v7） ---------------------
+# ---- funnel_runs（L1→L2 可回溯存档，v7） ---------------------------------------------
 
 
 def insert_funnel_run(strategy: str, snapshot_date: str | None, mode: str,
@@ -1513,36 +1550,41 @@ def query_funnel_runs(strategy: str | None = None, run_date: str | None = None,
         c.close()
 
 
-def insert_aggregate_run(sentiment_label: str | None, sentiment_regime: str | None,
-                         funnel_run_ids: list[int], result: list[dict]) -> int:
-    import json as _json
-    c = _conn()
-    try:
-        cur = c.execute(
-            "INSERT INTO aggregate_runs (run_date, sentiment_label, sentiment_regime, "
-            "funnel_run_ids, result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (_now()[:10], sentiment_label, sentiment_regime,
-             _json.dumps(funnel_run_ids), _json.dumps(result, ensure_ascii=False), _now()))
-        c.commit()
-        return cur.lastrowid
-    finally:
-        c.close()
+# aggregate_runs 写入/查询函数已随聚合层移除（2026-11-04）。
+# 既有库中的历史数据保留（证据永不删），需要时用 SQL 直接查 aggregate_runs 表。
 
 
-def query_aggregate_runs(run_date: str | None = None, limit: int = 10) -> list[dict]:
-    import json as _json
+def query_funnel_candidates(strategy: str | None = None,
+                            run_date: str | None = None,
+                            code: str | None = None,
+                            latest: bool = True,
+                            limit: int = 100) -> list[dict]:
+    """候选级明细（funnel_candidates 视图）：一只票一行，含所属运行/策略/趋势分。
+
+    latest=True（默认）：每个策略只取**最近一次**运行，避免同日多次扫描重复。
+    """
     c = _conn()
     try:
-        sql = ("SELECT id, run_date, sentiment_label, sentiment_regime, funnel_run_ids, "
-               "result, created_at FROM aggregate_runs")
-        args: list = []
+        sql = ("SELECT run_id, run_date, strategy, snapshot_date, code, name, close, "
+               "screen_score, trend_score, trend_grade, change_pct, amount, "
+               "turnover_rate, volume_ratio, pe, pb FROM funnel_candidates")
+        conds, args = [], []
+        if strategy:
+            conds.append("strategy=?"); args.append(strategy)
         if run_date:
-            sql += " WHERE run_date=?"; args.append(run_date)
-        sql += " ORDER BY id DESC LIMIT ?"; args.append(limit)
-        return [{"id": r[0], "run_date": r[1], "sentiment_label": r[2],
-                 "sentiment_regime": r[3], "funnel_run_ids": _json.loads(r[4]),
-                 "result": _json.loads(r[5]), "created_at": r[6]}
-                for r in c.execute(sql, args).fetchall()]
+            conds.append("run_date=?"); args.append(run_date)
+        if code:
+            conds.append("code=?"); args.append(code)
+        if latest:
+            conds.append("run_id IN (SELECT MAX(id) FROM funnel_runs GROUP BY strategy)")
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY run_date DESC, trend_score DESC LIMIT ?"
+        args.append(limit)
+        keys = ("run_id", "run_date", "strategy", "snapshot_date", "code", "name",
+                "close", "screen_score", "trend_score", "trend_grade",
+                "change_pct", "amount", "turnover_rate", "volume_ratio", "pe", "pb")
+        return [dict(zip(keys, r)) for r in c.execute(sql, args).fetchall()]
     finally:
         c.close()
 

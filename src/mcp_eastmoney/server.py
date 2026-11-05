@@ -307,12 +307,16 @@ async def market_sentiment(date: str = "") -> str:
         "Save an AI stock recommendation. code: 6位代码; thesis: 推荐逻辑; "
         "concepts: 概念标签逗号分隔; style: 打板/低吸/趋势/事件驱动; "
         "target_horizon: 预期持有天数(默认5); confidence: 置信度1-5; "
-        "skill_version: 方法论版本(默认v1)。入场价自动取推荐日收盘价。"
+        "skill_version: 方法论版本(策略名，如 shrink_pullback); "
+        "run_id: 该票出自哪次策略运行（scan_all/funnel_runs 返回的 id，证据链闭合）; "
+        "risk_flags: 风险标记逗号分隔（如 涨幅过热,高换手，落表时冻结）。"
+        "入场价自动取推荐日收盘价。"
     ),
 )
 async def save_recommendation(
     code: str, thesis: str, concepts: str = "", style: str = "事件驱动",
     target_horizon: int = 5, confidence: int = 3, skill_version: str = "v1",
+    run_id: int = 0, risk_flags: str = "",
 ) -> str:
     """Persist an AI recommendation with full context for later review."""
     try:
@@ -356,10 +360,23 @@ async def save_recommendation(
     rid = db.insert_recommendation(
         c, name, thesis, concepts, style, entry, target_horizon,
         max(1, min(5, confidence)), skill_version, strategy_def=strategy_def,
+        run_id=run_id or None,
+        risk_flags=_d([f.strip() for f in risk_flags.split(",") if f.strip()]) if risk_flags else None,
     )
+    # run_id 软校验：指向的漏斗运行存在才算闭合（不存在仅提示，不阻断落表）
+    run_linked = False
+    if run_id:
+        con = db._conn()
+        try:
+            run_linked = bool(con.execute(
+                "SELECT 1 FROM funnel_runs WHERE id=?", (run_id,)).fetchone())
+        finally:
+            con.close()
     return _d({"ok": True, "rec_id": rid, "code": c, "name": name,
                "entry_ref_price": entry, "skill_version": skill_version,
                "strategy_snapshot": bool(strategy_def),
+               "run_id": run_id or None, "run_linked": run_linked,
+               "risk_flags": [f.strip() for f in risk_flags.split(",") if f.strip()] or None,
                "note": "eod 任务将每日自动评估绩效（T+1起，到期终评）"})
 
 
@@ -486,12 +503,7 @@ def _resolve_code(code: str) -> tuple[str, bool]:
     return normalize(c), False
 
 
-def _local_bars_get(code: str) -> list[dict] | None:
-    """筛选计算层段用的本地K线注入（同步、只读本地库，不触发网络）。"""
-    rows = db.query_klines_daily(code, limit=320)
-    bars = list(reversed(rows))
-    # 有行即返回（历史过短由因子判死）；无行才降级放行
-    return bars if bars else None
+
 
 
 @app.tool(
@@ -801,20 +813,7 @@ async def get_chip_distribution(code: str, limit: int = 1) -> str:
         return _d({"code": c, **result})
     result["code"] = c
     result["source"] = source
-    # 落库（今日快照），历史趋势可反复查询
-    try:
-        db.upsert_chip_daily([{
-            "code": c, "trade_date": result["date"],
-            "profit_ratio_pct": result["profit_ratio_pct"],
-            "avg_cost": result["avg_cost"],
-            "cost_90_low": result["cost_90_low"],
-            "cost_90_high": result["cost_90_high"],
-            "concentration_pct": result["concentration_pct"],
-        }])
-    except Exception:
-        pass  # 落库失败不影响返回
-    if limit > 1:
-        result["history"] = db.query_chip_daily(c, limit)
+    # 纯现算：筹码由日K迭代得出（chip_daily 表已退役，避免重复存储）
     return _d(result)
 
 
@@ -912,7 +911,7 @@ async def screen(
         except Exception as e:
             return _d({"error": f"本地无快照且现拉失败: {e}",
                        "hint": "先运行 refresh snapshot"})
-    result = S.screen(rows, s, top_n, bars_get=_local_bars_get)
+    result = S.screen(rows, s, top_n, bars_get=S.local_bars_get)
     out: dict = {
         "strategy": s["name"], "display_name": s.get("display_name"),
         "style": s.get("style"), "snapshot_source": source,
@@ -939,34 +938,26 @@ async def screen(
 @app.tool(
     name="run_pipeline",
     description=(
-        "一键执行推荐漏斗：screen策略筛选 → trend_score趋势终审(<65分淘汰/一票否决) → "
-        "排雷(业绩预减/一字板买不进) → ATR风险预算定仓。Run the full recommendation "
-        "pipeline. 输出候选包(含证据链+建议仓位)与各级淘汰名单。"
-        "AI 只需对候选包终审 ≤3 只 → save_recommendation(skill_version=策略名)。"
-        "早盘推荐报告的首选入口，替代手工串联多工具。"
+        "执行策略漏斗（只做 L1→L2）：screen 截面筛选+因子打分 → trend_score 趋势终审"
+        "(<阈值淘汰/一票否决)。Run the L1-L2 strategy funnel. "
+        "输出该策略的标的池（含趋势分与快照证据）与各级淘汰明细。"
+        "L2 之后的打分/排雷/仓位/落表由聚合层与终审流程实施；"
+        "本工具同时把运行证据存档到 funnel_runs（可回溯）。"
     ),
 )
 async def run_pipeline(
     strategy: str, top_n: int = 10, min_trend_score: float = 65.0,
-    capital: float = 100_000.0, risk_pct: float = 1.0,
     add_watchlist: bool = False, fetch_history: bool = True,
 ) -> str:
-    """Run the full screening pipeline and return a candidate pack."""
+    """Run the L1-L2 strategy funnel and return its candidate pool."""
     from .recommend import pipeline as P
-    # pipeline 为 async：L2 遇缺K线候选当场补拉（Baostock→腾讯全量兜底）
+    # pipeline 为 async：L2 遇缺K线候选当场补拉
     result = await P.run_pipeline(strategy, top_n=top_n,
                                   min_trend_score=min_trend_score,
-                                  capital=capital, risk_pct=risk_pct)
+                                  fetch_history=fetch_history)
     if "error" in result:
         return _d(result)
-    # 候选落库 screen_runs（复盘可查当时漏斗证据）
-    try:
-        run_id = db.insert_screen_run(
-            result["strategy"], result["universe"], result["filtered"],
-            result["candidates"])
-        result["run_id"] = run_id
-    except Exception:
-        pass
+    # 存档由 pipeline 内部完成（funnel_runs，全量证据），result.run_id 即存档 id
     if add_watchlist and result["candidates"]:
         added = []
         for c in result["candidates"]:
@@ -1139,19 +1130,19 @@ async def get_sector_flow(
 
 
 @app.tool(
-    name="aggregate_scan",
+    name="scan_all",
     description=(
-        "聚合扫描：15 个策略并行跑 L1→L2（每次运行存档 funnel_runs 可回溯），"
-        "合并成统一候选榜——标注共振数(≥2 策略命中优先)、所属行业、板块资金流排名、"
-        "情绪适配。Aggregate all strategy funnels into one ranked board. "
-        "排序规则透明：共振↓→板块资金流↑→趋势分↓，不做加权黑盒。"
-        "榜单是 AI 终审的入口：共振票优先深评 → 精选 ≤3 → save_recommendation。"
+        "全策略批量扫描：15 个策略各自跑 L1→L2、各自排序、各自存档 funnel_runs。"
+        "All strategy lanes, NO cross-strategy merging. "
+        "不做合并/去重/共振/跨策略排序——排序只发生在各策略内部。"
+        "返回各策略榜单 + 当日情绪 + 每策略 market_regime 适配标注（fits_today）。"
+        "AI 终审入口：按情绪选道（适配策略优先看）→ 榜内选优 → 深评 → 精选 ≤3。"
     ),
 )
-async def aggregate_scan(top_n: int = 10, min_trend_score: float = 65.0) -> str:
-    """Run all strategy funnels (L2 exit) and aggregate into one ranked board."""
-    from .recommend.aggregate import aggregate_scan as _agg
-    result = await _agg(top_n=top_n, min_trend_score=min_trend_score)
+async def scan_all(top_n: int = 10, min_trend_score: float = 65.0) -> str:
+    """Run all strategy funnels (L2 exit), each lane ranked and persisted separately."""
+    from .recommend.scan_all import scan_all as _scan
+    result = await _scan(top_n=top_n, min_trend_score=min_trend_score)
     return _d(result)
 
 
@@ -1160,7 +1151,7 @@ async def aggregate_scan(top_n: int = 10, min_trend_score: float = 65.0) -> str:
     description=(
         "查询历史漏斗运行存档（L1→L2 可回溯）：每次运行的收窄计数、L2 出口标的、"
         "各级淘汰明细（code/stage/reason）。Historical funnel runs with full evidence. "
-        "strategy/run_date 可过滤。配合 aggregate_runs 榜单可完整回答"
+        "strategy/run_date 可过滤。可完整回答"
         "'当时为什么选出这些票、其他票死在哪一层'。"
     ),
 )
@@ -1172,16 +1163,21 @@ async def funnel_runs(strategy: str = "", run_date: str = "", limit: int = 10) -
 
 
 @app.tool(
-    name="aggregate_runs",
+    name="funnel_candidates",
     description=(
-        "查询历史聚合榜存档：当日情绪、共振标注、榜单全文、关联的漏斗 run id。"
-        "Historical aggregated boards. 用于复盘'当天榜单 vs 后验表现'。"
+        "候选级明细（funnel_runs 展开成一只票一行）：运行日/策略/代码/名称/趋势分/快照证据。"
+        "Candidate-level view over archived funnel runs. "
+        "strategy/run_date/code 可过滤；默认每个策略只取最近一次运行（避免同日多次扫描重复）。"
+        "用于'按票查'或'某策略最近选了哪些票'。"
     ),
 )
-async def aggregate_runs(run_date: str = "", limit: int = 5) -> str:
-    """Query archived aggregate boards."""
-    rows = db.query_aggregate_runs(run_date or None, limit)
-    return _d({"count": len(rows), "runs": rows})
+async def funnel_candidates(strategy: str = "", run_date: str = "",
+                            code: str = "", latest: bool = True,
+                            limit: int = 100) -> str:
+    """Query candidate-level rows from archived funnel runs."""
+    rows = db.query_funnel_candidates(strategy or None, run_date or None,
+                                      code or None, latest, limit)
+    return _d({"count": len(rows), "candidates": rows})
 
 
 # ---- Skill 层工具（报告归档；模板本体在 DSH skill：scratch-plugin/skills/） ----------

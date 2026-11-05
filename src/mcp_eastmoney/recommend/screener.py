@@ -96,6 +96,18 @@ def _percentile(values: list[float], invert: bool) -> list[float]:
             for s in crosssec.neutral_fill(scores)]
 
 
+def local_bars_get(code: str, limit: int = 320) -> list[dict] | None:
+    """计算层段的本地K线注入（唯一实现，server/pipeline 共用）。
+
+    有行即返回（历史过短由因子判死）；无行（从未入库）返回 None → 降级放行。
+    只读本地库，不触发网络。
+    """
+    from ..data import db
+    rows = db.query_klines_daily(code, limit=limit)
+    bars = list(reversed(rows))
+    return bars if bars else None
+
+
 def _compute_stage(strategy: dict, pool: list[dict],
                    bars_get: Callable[[str], list[dict] | None] | None,
                    ) -> tuple[dict[str, dict[str, float | None]],

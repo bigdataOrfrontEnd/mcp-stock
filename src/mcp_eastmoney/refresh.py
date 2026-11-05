@@ -324,6 +324,107 @@ async def refresh_valuation(codes: list[str]) -> dict:
     return {"updated": results, "total": len(codes)}
 
 
+async def refresh_daily_market(concurrency: int = 4, retries: int = 2) -> dict:
+    """全市场日K增量（eod 第 1 步）——quotes_daily 是唯一真相源，必须全量维护。
+
+    对每个在市股票：库内最后交易日 < 目标交易日 → 腾讯取最近 N 根补齐
+    （缺口≤5 日取 10 根，更大缺口取 60 根）；腾讯失败降级新浪（source=sina_raw），
+    连续 12 失败熔断直走新浪（限流保护）。已最新的票直接跳过（幂等）。
+    换手率/PE/PB/市值：当日行由 snapshot 步骤补齐（COALESCE 合并，不覆盖）。
+    """
+    from .data.tencent_client import get_daily_kline, get_daily_kline_sina
+    import pandas as pd
+    # ① 批量行情摄入（原 snapshot 步骤合并进来）：一次覆盖全市场当日
+    #    OHLCV + PE/PB/总市值/流通市值/换手/量比（K线接口不提供这些字段）
+    ingest: dict = {}
+    try:
+        ingest = await refresh_snapshot()
+    except Exception as e:
+        ingest = {"error": str(e)}
+    codes = _active_stock_codes()
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_idx = db.get_last_index_date("sh.000001")
+    # 目标日：交易日取今天（收盘后），周末取最近交易日
+    target = today if datetime.now().weekday() < 5 else (last_idx or today)
+    c = db._conn()
+    try:
+        have = dict(c.execute(
+            "SELECT code, MAX(trade_date) FROM quotes_daily GROUP BY code").fetchall())
+    finally:
+        c.close()
+    todo = [x for x in codes if (have.get(x) or "") < target]
+    if not todo:
+        log.info("daily_market: 全市场已最新（目标 %s），缺口修复跳过", target)
+        return {"target": target, "universe": len(codes), "ingest": ingest,
+                "todo": 0, "ok": 0, "fail": 0}
+    sem = asyncio.Semaphore(concurrency)
+    state = {"tencent_fail": 0, "tencent_ok": True}
+    ok = fail = 0
+    by_source = {"tencent_qfq": 0, "sina_raw": 0}
+    t_all = time.monotonic()
+
+    async def one(code: str) -> str | None:
+        async with sem:
+            last = have.get(code) or ""
+            gap_days = 60  # 未知/大缺口
+            if last:
+                try:
+                    gap_days = (datetime.strptime(target, "%Y-%m-%d")
+                                - datetime.strptime(last, "%Y-%m-%d")).days
+                except ValueError:
+                    gap_days = 60
+            count = 10 if gap_days <= 5 else 60
+            sources = [("tencent_qfq", get_daily_kline), ("sina_raw", get_daily_kline_sina)]
+            if not state["tencent_ok"]:
+                sources = sources[1:]
+            for source, fn in sources:
+                for attempt in range(1, retries + 1):
+                    try:
+                        bars = await fn(code, count)
+                        if not bars:
+                            break
+                        n = db.upsert_klines_daily(pd.DataFrame([{
+                            "code": code, "date": b["date"], "open": b["open"],
+                            "high": b["high"], "low": b["low"], "close": b["close"],
+                            "volume": b["volume"], "amount": b["amount"],
+                            "pctChg": b["change_pct"],
+                        } for b in bars]), source=source)
+                        if source == "tencent_qfq":
+                            state["tencent_fail"] = 0
+                        return source if n else None
+                    except Exception:
+                        if source == "tencent_qfq":
+                            state["tencent_fail"] += 1
+                            if state["tencent_fail"] >= 12:
+                                state["tencent_ok"] = False
+                                log.warning("daily_market: 腾讯连续失败 %d 次，本次熔断直走新浪",
+                                            state["tencent_fail"])
+                        if attempt < retries:
+                            await asyncio.sleep(0.5 * attempt)
+            return None
+
+    for i in range(0, len(todo), 200):
+        chunk = todo[i:i + 200]
+        res = await asyncio.gather(*(one(x) for x in chunk))
+        for x in res:
+            if x:
+                ok += 1
+                by_source[x] = by_source.get(x, 0) + 1
+            else:
+                fail += 1
+        log.info("daily_market 进度 %d/%d（ok=%d %s fail=%d %.0fs）",
+                 min(i + 200, len(todo)), len(todo), ok, by_source, fail,
+                 time.monotonic() - t_all)
+        await asyncio.sleep(0.1)
+    out = {"target": target, "universe": len(codes), "ingest": ingest,
+           "todo": len(todo), "ok": ok, "by_source": by_source,
+           "fail": fail, "elapsed_s": round(time.monotonic() - t_all, 1)}
+    db.log_fetch("daily", "market_increment", "tencent/sina", "success", 0,
+                 param=f"{target}/{ok}ok/{fail}fail")
+    log.info("daily_market 完成: %s", out)
+    return out
+
+
 async def refresh_history_fast(concurrency: int = 2, retries: int = 2) -> dict:
     """全市场日K快速回填（腾讯 qfq 主 + 新浪备用，幂等断点续跑）。
 
@@ -464,11 +565,13 @@ async def refresh_fin_all() -> dict:
 # ---- 板块资金流（行业 + 概念；主线判断的数据底座） ------------------------------------
 
 async def refresh_sector_flow() -> dict:
-    """东财板块资金流落库：行业 + 概念各一份，按 (trade_date, type, code) 幂等。
+    """板块资金流落库：行业 + 概念各一份，按 (trade_date, type, code) 幂等。
 
-    借鉴 InStock 的行业/概念资金流两表做法（同表 sector_type 区分）。
-    数据源 push2 需绕过系统代理——EastmoneyClient 内部已 trust_env=False。
+    源降级链：东财 push2（主力单分解全）→ 同花顺（全单口径，仅 main_net；
+    行业体系与 sector_rotation 同源，行业名可直接对上）。fetch_log 的 source
+    字段记录实际命中源，事后可审计口径。
     """
+    from .data import akshare_client as akc
     from .data.eastmoney import EastmoneyClient
     date = datetime.now().strftime("%Y-%m-%d")
     cli = EastmoneyClient()
@@ -476,15 +579,31 @@ async def refresh_sector_flow() -> dict:
     try:
         for kind in ("industry", "concept"):
             t0 = time.monotonic()
+            rows: list[dict] | None = None
+            source = "eastmoney"
+            em_err: Exception | None = None
             try:
                 rows = await cli.sector_flow_raw(kind)
+            except Exception as e:
+                em_err = e
+            if not rows:
+                try:
+                    rows = await akc.sector_flow_raw(kind)
+                    source = "ths(同花顺,全单口径)"
+                except Exception as ths_err:
+                    err = f"eastmoney: {em_err}; ths: {ths_err}" if em_err else f"ths: {ths_err}"
+                    out[kind] = f"failed: {err}"
+                    db.log_fetch(f"sector_{kind}", "clist/sector", "eastmoney", "failed",
+                                 int((time.monotonic() - t0) * 1000), error=err)
+                    continue
+            try:
                 n = db.upsert_sector_flow(rows, date, kind)
                 out[kind] = n
-                db.log_fetch(f"sector_{kind}", "clist/sector", "eastmoney", "success",
+                db.log_fetch(f"sector_{kind}", "clist/sector", source, "success",
                              int((time.monotonic() - t0) * 1000), param=f"{n}行")
             except Exception as e:
                 out[kind] = f"failed: {e}"
-                db.log_fetch(f"sector_{kind}", "clist/sector", "eastmoney", "failed",
+                db.log_fetch(f"sector_{kind}", "clist/sector", source, "failed",
                              int((time.monotonic() - t0) * 1000), error=str(e))
     finally:
         await cli.aclose()
@@ -547,37 +666,6 @@ def refresh_prune(fetchlog_days: int = 30, min15_days: int = 30) -> dict:
     db.log_fetch("prune", "internal", "sqlite", "success", 0, param=str(out))
     log.info("prune 清理: %s", out)
     return out
-
-
-# ---- 筹码快照 ----------------------------------------------------------------------
-
-
-async def refresh_chips(codes: list[str]) -> dict:
-    """对指定股票计算筹码快照落库（自选股每日积累获利盘趋势）。
-
-    纯本地计算（quotes_daily 日K+换手率 → 三角分布模型），不发网络请求。
-    """
-    from .compute import chips as C
-    results: dict[str, str] = {}
-    for code in codes:
-        try:
-            bars = list(reversed(db.query_klines_daily(code, limit=210)))
-            r = C.analyze(bars)
-            if "error" in r:
-                results[code] = f"skip({r['error']})"
-                continue
-            db.upsert_chip_daily([{
-                "code": code, "trade_date": r["date"],
-                "profit_ratio_pct": r["profit_ratio_pct"],
-                "avg_cost": r["avg_cost"], "cost_90_low": r["cost_90_low"],
-                "cost_90_high": r["cost_90_high"],
-                "concentration_pct": r["concentration_pct"],
-            }])
-            results[code] = f"ok(profit={r['profit_ratio_pct']}%)"
-        except Exception as e:
-            results[code] = f"failed: {e}"
-    log.info("chips 结果: %s", results)
-    return {"updated": results, "total": len(codes)}
 
 
 # ---- 全市场快照 ----------------------------------------------------------------------
@@ -809,7 +897,11 @@ INDUSTRY_INDEX_START = "2024-01-01"  # 行业指数回补起点（轮动分析�
 
 
 async def _fill_today_tencent_index(code_key: str) -> int:
-    """当日兜底：index_daily 缺今日时用腾讯源补。"""
+    """当日指数兜底链：腾讯日K → 腾讯实时行情（构造当日bar）→ 放弃。
+
+    Baostock 当日数据 17:30 后才发布；eod 16:10 跑时只能靠这里兜底。
+    实时行情接口（qt.gtimg.cn，批量）稳定可用，含 open/high/low/price/成交额。
+    """
     from .data import tencent_client
     today = datetime.now().strftime("%Y-%m-%d")
     if datetime.now().weekday() >= 5:
@@ -817,16 +909,37 @@ async def _fill_today_tencent_index(code_key: str) -> int:
     last = db.get_last_index_date(code_key)
     if last and last >= today:
         return 0
-    rows = await tencent_client.get_kline_daily(code_key, limit=5)
-    if not rows:
-        return 0
     name = INDEXES.get(code_key, code_key)
+    # ① 腾讯日K接口（可能 501 限流）
+    try:
+        rows = await tencent_client.get_kline_daily(code_key, limit=5)
+    except Exception:
+        rows = []
+    if rows:
+        return db.upsert_index_daily(
+            code_key, name, "broad",
+            [{"date": r["date"], "open": r["open"], "high": r["high"], "low": r["low"],
+              "close": r["close"], "volume": r["volume"], "amount": None,
+              "change_pct": None} for r in rows],
+            source="tencent",
+        )
+    # ② 腾讯实时行情 → 当日 bar（收盘后即为收盘数据）
+    try:
+        quotes = await tencent_client.get_batch_quotes([code_key])
+    except Exception:
+        return 0
+    if not quotes:
+        return 0
+    q = quotes[0]
+    if not q.get("price"):
+        return 0
     return db.upsert_index_daily(
         code_key, name, "broad",
-        [{"date": r["date"], "open": r["open"], "high": r["high"], "low": r["low"],
-          "close": r["close"], "volume": r["volume"], "amount": None, "change_pct": None}
-         for r in rows],
-        source="tencent",
+        [{"date": today, "open": q.get("open"), "high": q.get("high"),
+          "low": q.get("low"), "close": q.get("price"),
+          "volume": q.get("volume"), "amount": q.get("amount"),
+          "change_pct": q.get("change_pct")}],
+        source="tencent_quote",
     )
 
 
@@ -1029,93 +1142,59 @@ async def refresh_zt_kline(days: int = 30) -> dict:
 
 
 async def refresh_eod() -> dict:
-    """每日收盘后全套：日K + 15min + 概念快照（针对自选股）。
+    """每日收盘后 eod（纯数据，7 步）：行情 + 情绪 + 指数 + 榜单原料。
 
-    补跑自查：若 fetch_log 中 daily 最后 success 早于今天且今天是交易日，
-    说明上次错过了，本次照常执行（增量逻辑天然补齐日K；15min 只能尽力补近日）。
+    顺序：daily_market(批量行情摄入+缺口修复) → ztpool → index → ind_index
+          → lhb → concepts → prune
+    分析与后验不在此处（morning 任务：推荐后验 + 15 策略 L2 扫描），
+    变化慢的数据由 weekly 维护（基础/行业/预告/财务/新闻/板块资金流）。
     """
     if not _is_trading_day_now():
         log.info("非交易日，跳过 eod")
         return {"skipped": "non-trading-day"}
-    last = db.last_success_at("daily")
-    log.info("上次 daily success: %s", last or "无")
-
-    codes = [w["code"] for w in db.watchlist_all()]
-    if not codes:
-        log.warning("watchlist 为空，eod 只刷概念")
+    log.info("上次 daily success: %s", db.last_success_at("daily") or "无")
     out: dict = {}
-    if codes:
-        out["daily"] = await refresh_daily(codes, days=0, include_15min=True)
+
+    async def _step(name: str, coro_factory):
         try:
-            out["chips"] = await refresh_chips(codes)
+            out[name] = await coro_factory()
         except Exception as e:
-            out["chips"] = {"error": str(e)}
-    try:
-        out["index"] = await refresh_index()
-    except Exception as e:
-        out["index"] = {"error": str(e)}
-    try:
-        out["industry_index"] = await refresh_industry_index()
-    except Exception as e:
-        out["industry_index"] = {"error": str(e)}
-    try:
-        out["lhb"] = await refresh_lhb()
-    except Exception as e:
-        out["lhb"] = {"error": str(e)}
-    try:
-        out["forecast"] = await refresh_forecast()
-    except Exception as e:
-        out["forecast"] = {"error": str(e)}
-    try:
-        out["fin"] = await refresh_fin()
-    except Exception as e:
-        out["fin"] = {"error": str(e)}
-    try:
-        out["concepts"] = await refresh_concepts()
-    except Exception as e:
-        out["concepts"] = {"error": str(e)}
-    try:
-        out["ztpool"] = await refresh_ztpool()
-    except Exception as e:
-        out["ztpool"] = {"error": str(e)}
-    try:
-        out["zt_kline"] = await refresh_zt_kline()
-    except Exception as e:
-        out["zt_kline"] = {"error": str(e)}
-    try:
-        from .recommend.dragon import scan_dragons as _dragon_scan
-        out["dragon"] = await _dragon_scan(persist=True)
-    except Exception as e:
-        out["dragon"] = {"error": str(e)}
-    try:
-        out["review"] = await review_recommendations()
-    except Exception as e:
-        out["review"] = {"error": str(e)}
-    try:
-        out["sector"] = await refresh_sector_flow()
-    except Exception as e:
-        out["sector"] = {"error": str(e)}
-    try:
-        out["news"] = await refresh_news()
-    except Exception as e:
-        out["news"] = {"error": str(e)}
-    try:
-        out["snapshot"] = await refresh_snapshot()
-    except Exception as e:
-        out["snapshot"] = {"error": str(e)}
-    try:
-        out["prune"] = refresh_prune()
-    except Exception as e:
-        out["prune"] = {"error": str(e)}
+            out[name] = {"error": str(e)}
+
+    # ① 行情（唯一真相源）：批量行情摄入(PE/市值/换手/量比) + 全市场日K缺口修复
+    await _step("daily_market", refresh_daily_market)
+    # ② 情绪原料（涨停池）：情绪 v2 定性 / 龙头 / 主线分布
+    await _step("ztpool", refresh_ztpool)
+    # ③ 大盘指数（时间基准 + 后验 α + 大盘环境）
+    await _step("index", refresh_index)
+    # ④ 行业指数（板块轮动 / 复盘主线）
+    await _step("ind_index", refresh_industry_index)
+    # ⑤ 龙虎榜（层4 资金验证）
+    await _step("lhb", refresh_lhb)
+    # ⑥ 概念成分（东财封禁期间失败不阻断）
+    await _step("concepts", refresh_concepts)
+    # ⑦ 板块资金流（行业+概念：聚合层的"资金流排名"维度依赖它，须每日）
+    await _step("sector", refresh_sector_flow)
+
+    # ⑧ 库瘦身（旧日志/旧分时）
+    out["prune"] = refresh_prune()
     return out
 
 
 async def refresh_weekly() -> dict:
-    """每周任务：基础信息 + 行业分类。"""
-    return {
-        "basic": await refresh_basic(),
-        "industry": await refresh_industry(),
-    }
+    """每周任务：变化慢的数据（股票池/行业/业绩预告/自选池财务）。
+
+    这些数据对 15 策略 L1→L2 无实时依赖，周更即可；失败单项不阻断其他项。
+    news 不在此维护（get_news 按需现拉）；sector 已移入 eod（每日数据）。
+    """
+    out: dict = {}
+    for name, fn in (("basic", refresh_basic), ("industry", refresh_industry),
+                     ("forecast", refresh_forecast), ("fin", lambda: refresh_fin())):
+        try:
+            out[name] = await fn()
+        except Exception as e:
+            out[name] = {"error": str(e)}
+    return out
 
 
 async def refresh_fin(codes: list[str] | None = None) -> dict:
@@ -1162,9 +1241,8 @@ TASKS = {
     "valuation": lambda a: refresh_valuation(_codes_from_args(a)),
     "history": lambda a: refresh_history_full(),
     "history_fast": lambda a: refresh_history_fast(),
+    "daily_market": lambda a: refresh_daily_market(),
     "prune": lambda a: refresh_prune(),
-    "chips": lambda a: refresh_chips(_codes_from_args(a) or
-                                     [w["code"] for w in db.watchlist_all()]),
     "snapshot": lambda a: refresh_snapshot(),
     "ind_index": lambda a: refresh_industry_index(),
     "lhb": lambda a: refresh_lhb(a.date),
@@ -1177,6 +1255,8 @@ TASKS = {
     "migrate_index": lambda a: migrate_index_from_quotes(),
     "index": lambda a: refresh_index(),
     "review": lambda a: review_recommendations(),
+    "scan_all": lambda a: __import__("mcp_eastmoney.recommend.scan_all",
+                                     fromlist=["scan_all"]).scan_all(),
     "dbinfo": lambda a: db_info(),
 }
 
@@ -1187,7 +1267,7 @@ def db_info() -> dict:
     tables = ["stock_basic", "stock_industry", "concept_members",
               "quotes_daily", "quotes_15min", "index_daily", "watchlist", "fetch_log",
               "news", "financial_indicators", "zt_pool", "lhb_daily",
-              "earnings_forecast", "chip_daily", "strategies", "screen_runs",
+              "earnings_forecast", "strategies", "screen_runs",
               "recommendations", "recommendation_reviews"]
     c = db._conn()
     info: dict = {"db_path": db.DB_PATH, "tables": {}}
